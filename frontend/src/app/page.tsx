@@ -1,103 +1,145 @@
-import Image from "next/image";
+'use client'; 
+
+// Importing the tools I need from React and the Swiper carousel library.
+import React, { useState, useRef } from 'react';
+import { Swiper, SwiperSlide } from 'swiper/react';
+import { EffectCoverflow, Pagination, Autoplay } from 'swiper/modules';
+import type { Swiper as SwiperCore } from 'swiper';
+import 'swiper/css';
+import 'swiper/css/effect-coverflow';
+import 'swiper/css/pagination';
 
 export default function Home() {
-  return (
-    <div className="font-sans grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="font-mono list-inside list-decimal text-sm/6 text-center sm:text-left">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] font-mono font-semibold px-1 py-0.5 rounded">
-              src/app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+  // Here, I'm setting up the state for my component. This is the information
+  // that will change as the user interacts with the page.
+  const [currentStepIndex, setCurrentStepIndex] = useState(0);
+  const [currentUserQuery, setCurrentUserQuery] = useState('');
+  const [currentAgentReply, setCurrentAgentReply] = useState('');
+  const [highlightedMemoryId, setHighlightedMemoryId] = useState<number | null>(null);
+  
+  // This ref gives me direct control over the carousel component.
+  const carouselRef = useRef<SwiperCore | null>(null);
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
+  // This is the hard-coded conversation I'm using for the demo.
+  const demoConversation = [
+    {
+      query: "Who was that person I met at TechCrunch who worked on crypto payments?",
+      response: "That would be Jennifer Chen, VP of Engineering at Stripe! You met her at their booth on day 2 of TechCrunch conference. She mentioned they were hiring senior engineers for their crypto payments team."
+    },
+    {
+      query: "Right! What else did we talk about?",
+      response: "You both bonded over being Stanford alumni, and she specifically mentioned their new payment APIs. You took a photo together at their booth, and she gave you her business card with instructions to reach out about the senior engineering role."
+    },
+    {
+      query: "Did I ever follow up with her?",
+      response: "Yes, I reminded you on Tuesday morning as requested, and you sent her a LinkedIn message that same day. She responded within 2 hours suggesting a coffee meeting, which you scheduled for the next Friday. You met at Blue Bottle Coffee downtown and had what you described as a 'great conversation about team culture and technical challenges.'"
+    },
+    {
+      query: "Perfect. I'm interviewing at Coinbase tomorrow and want to mention my connection to Stripe's crypto work. Can you give me some talking points?",
+      response: "Based on your conversation with Jennifer, here are some relevant points: • Stripe is actively investing in crypto infrastructure with dedicated teams • They're focusing on enterprise-grade payment solutions (Jennifer's emphasis) • Their approach prioritizes regulatory compliance and security • Jennifer mentioned they're seeing huge demand from fintech companies. This shows you're plugged into industry trends and have insights from a senior leader in the space. Would you like me to find other crypto-related conversations from your memory?"
+    }
+  ];
+
+  // This is the list of photos for the carousel.
+  const memoryPhotos = [
+    { id: 1, name: 'Jennifer Chen', imageUrl: '/placeholder.png' },
+    { id: 2, name: 'Jake\'s Bday', imageUrl: '/placeholder.png' },
+    { id: 3, name: 'Coffee Meetup', imageUrl: '/placeholder.png' },
+    { id: 4, name: 'Team Lunch', imageUrl: '/placeholder.png' },
+    { id: 5, name: 'Project Demo', imageUrl: '/placeholder.png' },
+  ];
+
+  // This function runs when the microphone button is clicked.
+  const runNextStepInDemo = () => {
+    const jenniferId = 1;
+    const jenniferIndex = memoryPhotos.findIndex(m => m.id === jenniferId);
+
+    // On the first click of the demo, I'll stop the autoplay and slide to Jennifer's photo.
+    if (currentStepIndex === 0) {
+      setHighlightedMemoryId(jenniferId);
+      if (carouselRef.current && jenniferIndex !== -1) {
+        carouselRef.current.autoplay.stop();
+        carouselRef.current.slideToLoop(jenniferIndex);
+      }
+    }
+
+    // I'll display the current step of the conversation...
+    const currentStep = demoConversation[currentStepIndex];
+    setCurrentUserQuery(currentStep.query);
+    setCurrentAgentReply(currentStep.response);
+    
+    // ...and then get ready for the next click by advancing the step index.
+    setCurrentStepIndex((prevIndex) => (prevIndex + 1) % demoConversation.length);
+  };
+
+  return (
+    <div className="bg-gray-900 text-gray-100 min-h-screen flex flex-col font-sans p-5 sm:p-8 overflow-y-auto">
+      
+      <header className="flex justify-between items-center pb-5 border-b border-gray-700 flex-shrink-0">
+        <div className="text-2xl font-bold">Live Witness</div>
+        <nav className="flex gap-4 sm:gap-6 text-gray-400">
+          <a href="/our-project" className="hover:text-white transition-colors">Our Project</a>
+          <a href="/meet-your-agents" className="hover:text-white transition-colors">Meet Your Agents</a>
+          <a href="/settings" className="hover:text-white transition-colors">Settings</a>
+        </nav>
+      </header>
+      
+      <main className="flex-grow flex flex-col items-center justify-start pt-10 w-full space-y-8">
+        
+        <Swiper
+          onSwiper={(swiper) => { carouselRef.current = swiper; }}
+          effect={'coverflow'}
+          grabCursor={true}
+          centeredSlides={true}
+          slidesPerView={3}
+          loop={true}
+          autoplay={{ delay: 3000, disableOnInteraction: false }}
+          coverflowEffect={{ rotate: 0, stretch: 0, depth: 150, modifier: 1, slideShadows: false }}
+          pagination={false}
+          modules={[EffectCoverflow, Pagination, Autoplay]}
+          className="w-full max-w-5xl"
+        >
+          {memoryPhotos.map(photo => (
+            <SwiperSlide key={photo.id}>
+              <div className="flex flex-col items-center justify-center h-full pt-10">
+                <img 
+                  src={photo.imageUrl} 
+                  alt={photo.name || ''}
+                  // This changes the image style if it's the one we're highlighting.
+                  className={`w-32 h-32 sm:w-40 sm:h-40 object-cover rounded-xl border-2 transition-all duration-300 ${
+                    highlightedMemoryId === photo.id 
+                    ? 'border-blue-400 scale-110'
+                    : 'border-gray-600'
+                  }`}
+                />
+                <span className="block mt-2 text-sm">{photo.name}</span>
+              </div>
+            </SwiperSlide>
+          ))}
+        </Swiper>
+       
+        <div className="flex justify-center items-center gap-12 w-full">
+          <div className="flex items-center gap-4">
+            <button 
+              onClick={runNextStepInDemo}
+              className="bg-gray-800 hover:bg-gray-700 transition-colors border border-gray-600 rounded-full w-16 h-16 text-4xl flex items-center justify-center flex-shrink-0"
+            >
+              🎤
+            </button>
+            <p className="text-gray-400 italic text-lg">"{currentUserQuery || 'Click the mic to start the conversation...'}"</p>
+          </div>
+          <button className="bg-gray-800 hover:bg-gray-700 transition-colors border border-gray-600 rounded-full w-16 h-16 text-4xl flex items-center justify-center flex-shrink-0">
+            🖼️
+          </button>
         </div>
+        
+        {currentAgentReply && (
+            <div className="mt-4 bg-gray-800 p-6 rounded-lg w-full max-w-3xl border border-gray-700">
+                <strong className="text-blue-400">AI Response:</strong>
+                <p className="mt-2 whitespace-pre-line">{currentAgentReply}</p>
+            </div>
+        )}
       </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
     </div>
   );
 }
