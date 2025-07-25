@@ -4,13 +4,11 @@ Welcome! This repository is your starting point for the **Agentic AI App Hackath
 
 - A consistent folder structure  
 - An environment spec (`environment.yml` or `Dockerfile`)  
-- A smoke-test script (`TEST.sh`)  
 - Documentation placeholders to explain your design and demo
 
 ## 📋 Submission Checklist
 
 - [ ] All code in `src/` runs without errors  
-- [ ] `bash TEST.sh` completes successfully  
 - [ ] `ARCHITECTURE.md` contains a clear diagram sketch and explanation  
 - [ ] `EXPLANATION.md` covers planning, tool use, memory, and limitations  
 - [ ] `DEMO.md` links to a 3–5 min video with timestamped highlights  
