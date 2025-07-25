@@ -1,373 +1,343 @@
-"""
-Event-driven communication system for coordinating between agents and components.
-Provides pub/sub messaging for loose coupling between system components.
-"""
-
 import asyncio
-import logging
-from typing import Dict, List, Callable, Any, Optional
-from datetime import datetime
+from typing import Dict, List, Any, Callable, Optional, Set
 from dataclasses import dataclass, field
-from enum import Enum
-import json
-import weakref
+from datetime import datetime
+from collections import defaultdict
+import logging
+import uuid
 
-
-class EventPriority(Enum):
-    LOW = 1
-    NORMAL = 2
-    HIGH = 3
-    CRITICAL = 4
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class Event:
-    """Represents an event in the system."""
-    event_type: str
-    data: Dict[str, Any]
+    """Represents an event in the system"""
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    type: str = ""
+    data: Dict[str, Any] = field(default_factory=dict)
+    source: str = ""
     timestamp: datetime = field(default_factory=datetime.now)
-    priority: EventPriority = EventPriority.NORMAL
-    source: Optional[str] = None
-    correlation_id: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
+class EventBusCallback:
+    """Callback handler that publishes events to the event bus"""
+    
+    def __init__(self, event_bus: 'EventBus', source: str = "langchain"):
+        self.event_bus = event_bus
+        self.source = source
+        
+    async def on_chain_start(self, serialized: Dict[str, Any], inputs: Dict[str, Any], **kwargs) -> None:
+        """Called when a chain starts running."""
+        await self.event_bus.publish(Event(
+            type="CHAIN_STARTED",
+            data={"serialized": serialized, "inputs": inputs},
+            source=self.source
+        ))
+        
+    async def on_chain_end(self, outputs: Dict[str, Any], **kwargs) -> None:
+        """Called when a chain ends running."""
+        await self.event_bus.publish(Event(
+            type="CHAIN_COMPLETED",
+            data={"outputs": outputs},
+            source=self.source
+        ))
+        
+    async def on_chain_error(self, error: Exception, **kwargs) -> None:
+        """Called when a chain errors."""
+        await self.event_bus.publish(Event(
+            type="CHAIN_ERROR",
+            data={"error": str(error)},
+            source=self.source
+        ))
+        
+    async def on_llm_start(self, serialized: Dict[str, Any], prompts: List[str], **kwargs) -> None:
+        """Called when LLM starts running."""
+        await self.event_bus.publish(Event(
+            type="LLM_STARTED",
+            data={"prompts": prompts},
+            source=self.source
+        ))
+        
+    async def on_llm_end(self, response: Any, **kwargs) -> None:
+        """Called when LLM ends running."""
+        await self.event_bus.publish(Event(
+            type="LLM_COMPLETED",
+            data={"response": str(response)},
+            source=self.source
+        ))
+
+
 class EventSubscription:
-    """Represents a subscription to an event type."""
-    callback: Callable
-    event_type: str
-    filter_func: Optional[Callable] = None
-    once: bool = False
-    created_at: datetime = field(default_factory=datetime.now)
+    """Represents a subscription to events"""
+    
+    def __init__(self, event_type: str, handler: Callable, filter_fn: Optional[Callable] = None):
+        self.id = str(uuid.uuid4())
+        self.event_type = event_type
+        self.handler = handler
+        self.filter_fn = filter_fn
+        self.created_at = datetime.now()
+        self.call_count = 0
 
 
 class EventBus:
-    """
-    Central event bus for managing pub/sub communication between agents.
-    Supports async event handling, filtering, and priority-based processing.
-    """
+    """Event bus implementation for LangChain agents"""
     
-    def __init__(self, max_queue_size: int = 1000):
-        self.max_queue_size = max_queue_size
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, max_event_history: int = 1000):
+        self.subscriptions: Dict[str, List[EventSubscription]] = defaultdict(list)
+        self.event_history: List[Event] = []
+        self.max_event_history = max_event_history
+        self.active_handlers: Set[str] = set()
+        self._lock = asyncio.Lock()
         
-        # Event subscriptions organized by event type
-        self._subscriptions: Dict[str, List[EventSubscription]] = {}
+    def create_callback_handler(self, source: str = "langchain") -> EventBusCallback:
+        """Create a LangChain callback handler that publishes to this event bus"""
+        return EventBusCallback(self, source)
         
-        # Event queues organized by priority
-        self._event_queues: Dict[EventPriority, asyncio.Queue] = {
-            priority: asyncio.Queue(maxsize=max_queue_size)
-            for priority in EventPriority
-        }
-        
-        # Event processing tasks
-        self._processing_tasks: List[asyncio.Task] = []
-        
-        # Event history for debugging and monitoring
-        self._event_history: List[Event] = []
-        self._max_history_size = 1000
-        
-        # Statistics
-        self._stats = {
-            "events_published": 0,
-            "events_processed": 0,
-            "subscribers_count": 0,
-            "processing_errors": 0
-        }
-        
-        # Weak references to avoid memory leaks
-        self._weak_subscriptions = weakref.WeakSet()
-        
-        # Start event processing
-        self._start_event_processing()
-    
-    def _start_event_processing(self):
-        """Start background tasks for processing events by priority."""
-        for priority in EventPriority:
-            task = asyncio.create_task(self._process_events(priority))
-            self._processing_tasks.append(task)
-    
-    async def _process_events(self, priority: EventPriority):
-        """Process events from a specific priority queue."""
-        queue = self._event_queues[priority]
-        
-        while True:
-            try:
-                event = await queue.get()
-                if event is None:  # Shutdown signal
-                    break
-                
-                await self._handle_event(event)
-                self._stats["events_processed"] += 1
-                
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self.logger.error(f"Error processing {priority.name} priority event: {e}")
-                self._stats["processing_errors"] += 1
-    
-    async def _handle_event(self, event: Event):
-        """Handle a single event by notifying all relevant subscribers."""
-        subscriptions = self._subscriptions.get(event.event_type, [])
-        
-        # Also check for wildcard subscriptions
-        wildcard_subscriptions = self._subscriptions.get("*", [])
-        all_subscriptions = subscriptions + wildcard_subscriptions
-        
-        # Process subscriptions concurrently
-        tasks = []
-        subscriptions_to_remove = []
-        
-        for subscription in all_subscriptions:
-            try:
-                # Apply filter if present
-                if subscription.filter_func:
-                    if not await self._apply_filter(subscription.filter_func, event):
-                        continue
-                
-                # Create task for async callback
-                task = asyncio.create_task(
-                    self._invoke_callback(subscription.callback, event)
-                )
-                tasks.append(task)
-                
-                # Mark one-time subscriptions for removal
-                if subscription.once:
-                    subscriptions_to_remove.append(subscription)
-                    
-            except Exception as e:
-                self.logger.error(f"Error preparing callback for {event.event_type}: {e}")
-        
-        # Wait for all callbacks to complete
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Remove one-time subscriptions
-        for subscription in subscriptions_to_remove:
-            self.unsubscribe(subscription.event_type, subscription.callback)
-        
-        # Add to history
-        self._add_to_history(event)
-    
-    async def _apply_filter(self, filter_func: Callable, event: Event) -> bool:
-        """Apply filter function to determine if event should be processed."""
-        try:
-            if asyncio.iscoroutinefunction(filter_func):
-                return await filter_func(event)
-            else:
-                return filter_func(event)
-        except Exception as e:
-            self.logger.error(f"Error applying event filter: {e}")
-            return False
-    
-    async def _invoke_callback(self, callback: Callable, event: Event):
-        """Invoke a callback function with error handling."""
-        try:
-            if asyncio.iscoroutinefunction(callback):
-                await callback(event)
-            else:
-                callback(event)
-        except Exception as e:
-            self.logger.error(f"Error in event callback for {event.event_type}: {e}")
-    
-    def _add_to_history(self, event: Event):
-        """Add event to history with size management."""
-        self._event_history.append(event)
-        
-        # Trim history if it exceeds max size
-        if len(self._event_history) > self._max_history_size:
-            self._event_history = self._event_history[-self._max_history_size:]
-    
-    async def emit(
-        self,
-        event_type: str,
-        data: Dict[str, Any],
-        priority: EventPriority = EventPriority.NORMAL,
-        source: Optional[str] = None,
-        correlation_id: Optional[str] = None,
-        metadata: Dict[str, Any] = None
-    ) -> bool:
-        """
-        Emit an event to the bus.
-        
-        Args:
-            event_type: Type identifier for the event
-            data: Event payload data
-            priority: Event processing priority
-            source: Source identifier (optional)
-            correlation_id: Correlation ID for request tracking (optional)
-            metadata: Additional metadata (optional)
+    async def subscribe(self, event_type: str, handler: Callable, filter_fn: Optional[Callable] = None) -> str:
+        """Subscribe to an event type"""
+        if not asyncio.iscoroutinefunction(handler):
+            raise ValueError("Handler must be an async function")
             
-        Returns:
-            bool: True if event was queued successfully
-        """
-        try:
+        subscription = EventSubscription(event_type, handler, filter_fn)
+        
+        async with self._lock:
+            self.subscriptions[event_type].append(subscription)
+            
+        logger.info(f"Subscribed to {event_type} with handler {handler.__name__} (ID: {subscription.id})")
+        return subscription.id
+        
+    async def unsubscribe(self, subscription_id: str) -> bool:
+        """Unsubscribe from events"""
+        async with self._lock:
+            for event_type, subs in self.subscriptions.items():
+                for sub in subs:
+                    if sub.id == subscription_id:
+                        subs.remove(sub)
+                        logger.info(f"Unsubscribed {subscription_id} from {event_type}")
+                        return True
+        return False
+        
+    async def publish(self, event: Event) -> None:
+        """Publish an event to all subscribers"""
+        if isinstance(event, dict):
+            # Convert dict to Event object for backwards compatibility
             event = Event(
-                event_type=event_type,
-                data=data,
-                priority=priority,
-                source=source,
-                correlation_id=correlation_id,
-                metadata=metadata or {}
+                type=event.get("type", "UNKNOWN"),
+                data=event.get("data", {}),
+                source=event.get("source", "unknown")
             )
             
-            queue = self._event_queues[priority]
-            
-            # Try to put event in queue (non-blocking)
-            try:
-                queue.put_nowait(event)
-                self._stats["events_published"] += 1
-                return True
-            except asyncio.QueueFull:
-                self.logger.warning(f"Event queue full for priority {priority.name}")
-                return False
+        # Add to history
+        async with self._lock:
+            self.event_history.append(event)
+            # Trim history if needed
+            if len(self.event_history) > self.max_event_history:
+                self.event_history = self.event_history[-self.max_event_history:]
                 
-        except Exception as e:
-            self.logger.error(f"Error emitting event {event_type}: {e}")
-            return False
-    
-    def subscribe(
-        self,
-        event_type: str,
-        callback: Callable,
-        filter_func: Optional[Callable] = None,
-        once: bool = False
-    ) -> EventSubscription:
-        """
-        Subscribe to events of a specific type.
+        logger.info(f"Publishing event: {event.type} from {event.source}")
         
-        Args:
-            event_type: Type of events to subscribe to (use "*" for all events)
-            callback: Function to call when event occurs
-            filter_func: Optional filter function to apply before calling callback
-            once: If True, subscription is automatically removed after first event
+        # Get subscribers for this event type
+        subscribers = self.subscriptions.get(event.type, [])
+        
+        # Also get wildcard subscribers
+        wildcard_subscribers = self.subscriptions.get("*", [])
+        
+        all_subscribers = subscribers + wildcard_subscribers
+        
+        # Call all handlers concurrently
+        tasks = []
+        for subscription in all_subscribers:
+            # Apply filter if present
+            if subscription.filter_fn and not subscription.filter_fn(event):
+                continue
+                
+            # Create handler task
+            task = asyncio.create_task(self._call_handler(subscription, event))
+            tasks.append(task)
             
-        Returns:
-            EventSubscription: The created subscription object
-        """
-        subscription = EventSubscription(
-            callback=callback,
-            event_type=event_type,
-            filter_func=filter_func,
-            once=once
-        )
+        # Wait for all handlers to complete
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"Handler error: {result}")
+                    
+    async def _call_handler(self, subscription: EventSubscription, event: Event) -> None:
+        """Call a single event handler"""
+        handler_id = f"{subscription.id}-{event.id}"
         
-        if event_type not in self._subscriptions:
-            self._subscriptions[event_type] = []
-        
-        self._subscriptions[event_type].append(subscription)
-        self._weak_subscriptions.add(subscription)
-        self._stats["subscribers_count"] += 1
-        
-        self.logger.debug(f"New subscription for {event_type}")
-        return subscription
-    
-    def unsubscribe(self, event_type: str, callback: Callable):
-        """
-        Unsubscribe from events.
-        
-        Args:
-            event_type: Type of events to unsubscribe from
-            callback: The callback function to remove
-        """
-        if event_type in self._subscriptions:
-            self._subscriptions[event_type] = [
-                sub for sub in self._subscriptions[event_type]
-                if sub.callback != callback
-            ]
+        # Prevent duplicate handling
+        if handler_id in self.active_handlers:
+            return
             
-            # Clean up empty subscription lists
-            if not self._subscriptions[event_type]:
-                del self._subscriptions[event_type]
-            
-            self._stats["subscribers_count"] -= 1
-            self.logger.debug(f"Unsubscribed from {event_type}")
-    
-    def once(
-        self,
-        event_type: str,
-        callback: Callable,
-        filter_func: Optional[Callable] = None
-    ) -> EventSubscription:
-        """
-        Subscribe to an event type but only receive it once.
-        
-        Args:
-            event_type: Type of events to subscribe to
-            callback: Function to call when event occurs
-            filter_func: Optional filter function
-            
-        Returns:
-            EventSubscription: The created subscription object
-        """
-        return self.subscribe(event_type, callback, filter_func, once=True)
-    
-    async def wait_for_event(
-        self,
-        event_type: str,
-        timeout: Optional[float] = None,
-        filter_func: Optional[Callable] = None
-    ) -> Optional[Event]:
-        """
-        Wait for a specific event to occur.
-        
-        Args:
-            event_type: Type of event to wait for
-            timeout: Maximum time to wait in seconds
-            filter_func: Optional filter function
-            
-        Returns:
-            Event or None if timeout occurred
-        """
-        future = asyncio.Future()
-        
-        def callback(event: Event):
-            if not future.done():
-                future.set_result(event)
-        
-        subscription = self.subscribe(event_type, callback, filter_func, once=True)
+        self.active_handlers.add(handler_id)
         
         try:
-            return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
-            self.unsubscribe(event_type, callback)
-            return None
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get event bus statistics."""
-        return {
-            **self._stats,
-            "queue_sizes": {
-                priority.name: queue.qsize()
-                for priority, queue in self._event_queues.items()
-            },
-            "subscription_types": list(self._subscriptions.keys()),
-            "active_subscriptions": sum(len(subs) for subs in self._subscriptions.values())
+            logger.debug(f"Calling handler {subscription.handler.__name__} for event {event.type}")
+            subscription.call_count += 1
+            await subscription.handler(event)
+            
+        except Exception as e:
+            logger.error(f"Error in handler {subscription.handler.__name__}: {str(e)}")
+            # Publish error event
+            error_event = Event(
+                type="HANDLER_ERROR",
+                data={
+                    "original_event": event.type,
+                    "handler": subscription.handler.__name__,
+                    "error": str(e)
+                },
+                source="event_bus"
+            )
+            # Don't await to avoid recursion
+            asyncio.create_task(self.publish(error_event))
+            
+        finally:
+            self.active_handlers.discard(handler_id)
+            
+    async def publish_batch(self, events: List[Event]) -> None:
+        """Publish multiple events"""
+        tasks = [self.publish(event) for event in events]
+        await asyncio.gather(*tasks)
+        
+    async def get_event_history(self, event_type: Optional[str] = None, limit: int = 100) -> List[Event]:
+        """Get event history, optionally filtered by type"""
+        async with self._lock:
+            if event_type:
+                filtered = [e for e in self.event_history if e.type == event_type]
+                return filtered[-limit:]
+            else:
+                return self.event_history[-limit:]
+                
+    async def get_subscription_stats(self) -> Dict[str, Any]:
+        """Get statistics about subscriptions"""
+        stats = {
+            "total_subscriptions": sum(len(subs) for subs in self.subscriptions.values()),
+            "event_types": list(self.subscriptions.keys()),
+            "subscriptions_by_type": {}
         }
+        
+        for event_type, subs in self.subscriptions.items():
+            stats["subscriptions_by_type"][event_type] = {
+                "count": len(subs),
+                "handlers": [sub.handler.__name__ for sub in subs],
+                "total_calls": sum(sub.call_count for sub in subs)
+            }
+            
+        return stats
+        
+    async def clear_event_history(self) -> None:
+        """Clear the event history"""
+        async with self._lock:
+            self.event_history.clear()
+            
+    def create_typed_publisher(self, event_type: str, source: str) -> Callable:
+        """Create a publisher function for a specific event type"""
+        async def publisher(data: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None):
+            event = Event(
+                type=event_type,
+                data=data,
+                source=source,
+                metadata=metadata or {}
+            )
+            await self.publish(event)
+        return publisher
+
+
+# Global event bus instance for convenience
+_global_event_bus: Optional[EventBus] = None
+
+
+def get_event_bus() -> EventBus:
+    """Get the global event bus instance"""
+    global _global_event_bus
+    if _global_event_bus is None:
+        _global_event_bus = EventBus()
+    return _global_event_bus
+
+
+# Test function
+async def test_event_bus():
+    """Test the event bus independently"""
+    event_bus = EventBus()
     
-    def get_recent_events(self, limit: int = 10) -> List[Event]:
-        """Get recent events from history."""
-        return self._event_history[-limit:]
+    # Test data collection
+    received_events = []
     
-    def clear_history(self):
-        """Clear event history."""
-        self._event_history.clear()
+    # Define test handlers
+    async def handler1(event: Event):
+        logger.info(f"Handler1 received: {event.type}")
+        received_events.append(("handler1", event))
+        
+    async def handler2(event: Event):
+        logger.info(f"Handler2 received: {event.type}")
+        received_events.append(("handler2", event))
+        await asyncio.sleep(0.1)  # Simulate some work
+        
+    async def wildcard_handler(event: Event):
+        logger.info(f"Wildcard handler received: {event.type}")
+        received_events.append(("wildcard", event))
+        
+    # Subscribe to events
+    sub1 = await event_bus.subscribe("TEST_EVENT", handler1)
+    sub2 = await event_bus.subscribe("TEST_EVENT", handler2)
+    sub3 = await event_bus.subscribe("ANOTHER_EVENT", handler1)
+    sub_wildcard = await event_bus.subscribe("*", wildcard_handler)
     
-    async def shutdown(self):
-        """Shutdown the event bus and cleanup resources."""
-        self.logger.info("Shutting down event bus...")
+    # Publish events
+    await event_bus.publish(Event(
+        type="TEST_EVENT",
+        data={"message": "Hello from test 1"},
+        source="test"
+    ))
+    
+    await event_bus.publish(Event(
+        type="ANOTHER_EVENT",
+        data={"message": "Another event"},
+        source="test"
+    ))
+    
+    # Test batch publish
+    batch_events = [
+        Event(type="TEST_EVENT", data={"batch": i}, source="batch_test")
+        for i in range(3)
+    ]
+    await event_bus.publish_batch(batch_events)
+    
+    # Wait for handlers to complete
+    await asyncio.sleep(0.5)
+    
+    # Get statistics
+    stats = await event_bus.get_subscription_stats()
+    print(f"Subscription stats: {stats}")
+    
+    # Get event history
+    history = await event_bus.get_event_history()
+    print(f"Event history count: {len(history)}")
+    
+    # Test typed publisher
+    test_publisher = event_bus.create_typed_publisher("TYPED_EVENT", "typed_test")
+    await test_publisher({"value": 42})
+    
+    # Test LangChain callback
+    callback = event_bus.create_callback_handler("langchain_test")
+    await callback.on_chain_start({}, {"input": "test"})
+    await callback.on_chain_end({"output": "result"})
+    
+    # Final statistics
+    print(f"Total events received: {len(received_events)}")
+    for handler_name, event in received_events:
+        print(f"  {handler_name}: {event.type}")
         
-        # Signal all processing tasks to stop
-        for priority, queue in self._event_queues.items():
-            await queue.put(None)
-        
-        # Wait for processing tasks to complete
-        if self._processing_tasks:
-            await asyncio.gather(*self._processing_tasks, return_exceptions=True)
-        
-        # Clear all subscriptions
-        self._subscriptions.clear()
-        self._weak_subscriptions.clear()
-        
-        self.logger.info("Event bus shutdown complete")
+    # Unsubscribe
+    await event_bus.unsubscribe(sub1)
+    
+    # Clear history
+    await event_bus.clear_event_history()
+
+
+if __name__ == "__main__":
+    asyncio.run(test_event_bus())

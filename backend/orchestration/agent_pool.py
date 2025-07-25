@@ -1,453 +1,444 @@
-"""
-Agent pool management system for maintaining and distributing agent instances.
-Handles agent lifecycle, load balancing, and resource management.
-"""
-
 import asyncio
-import logging
-from typing import Dict, List, Optional, Any, Type
-from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional, Type
 from dataclasses import dataclass, field
-from enum import Enum
-import weakref
+from datetime import datetime
 from collections import defaultdict
-import importlib
+import logging
+from abc import ABC, abstractmethod
+import uuid
 
-from ..agents.base_agent import BaseAgent
-from ..agents.planner_agent import PlannerAgent
-from ..agents.voice_agent import VoiceAgent
-from ..agents.vision_agent import VisionAgent
-from ..agents.context_agent import ContextAgent
-from ..agents.memory_agent import MemoryAgent
-from ..agents.insight_agent import InsightAgent
-from ..agents.response_agent import ResponseAgent
-
-
-class AgentType(Enum):
-    PLANNER = "planner"
-    VOICE = "voice"
-    VISION = "vision"
-    CONTEXT = "context"
-    MEMORY = "memory"
-    INSIGHT = "insight"
-    RESPONSE = "response"
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class AgentInstance:
-    """Represents an agent instance in the pool."""
-    id: str
-    agent_type: AgentType
-    agent: BaseAgent
+    """Represents an instance of an agent in the pool"""
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    agent_type: str = ""
+    agent: Optional[Any] = None  # The actual agent instance
+    status: str = "available"  # available, busy, error
     created_at: datetime = field(default_factory=datetime.now)
-    last_used: datetime = field(default_factory=datetime.now)
+    last_used_at: Optional[datetime] = None
     usage_count: int = 0
-    is_busy: bool = False
     current_task_id: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    memory: Optional[Dict[str, Any]] = None
 
 
-@dataclass
-class PoolStats:
-    """Statistics for the agent pool."""
-    total_agents: int
-    active_agents: int
-    idle_agents: int
-    agent_counts_by_type: Dict[str, int]
-    average_usage: float
-    total_requests: int
-    pool_efficiency: float
+class BasePooledAgent(ABC):
+    """Base class for agents that can be pooled"""
+    
+    def __init__(self, agent_id: str):
+        self.agent_id = agent_id
+        self.created_at = datetime.now()
+        self.usage_count = 0
+        
+    @abstractmethod
+    async def initialize(self) -> None:
+        """Initialize the agent (load models, etc.)"""
+        pass
+        
+    @abstractmethod
+    async def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Process a request"""
+        pass
+        
+    @abstractmethod
+    async def cleanup(self) -> None:
+        """Cleanup resources"""
+        pass
+        
+    async def reset(self) -> None:
+        """Reset the agent state between uses"""
+        pass
+
+
+class MockVoiceAgent(BasePooledAgent):
+    """Mock voice agent for testing"""
+    
+    async def initialize(self) -> None:
+        logger.info(f"Initializing MockVoiceAgent {self.agent_id}")
+        await asyncio.sleep(0.1)  # Simulate initialization
+        
+    async def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        self.usage_count += 1
+        audio = data.get("audio_data", "")
+        # Simulate processing
+        await asyncio.sleep(0.5)
+        return {
+            "transcription": f"Transcribed audio (agent {self.agent_id})",
+            "confidence": 0.95
+        }
+        
+    async def cleanup(self) -> None:
+        logger.info(f"Cleaning up MockVoiceAgent {self.agent_id}")
+
+
+class MockPlannerAgent(BasePooledAgent):
+    """Mock planner agent for testing"""
+    
+    async def initialize(self) -> None:
+        logger.info(f"Initializing MockPlannerAgent {self.agent_id}")
+        self.memory = {}  # Simple dict instead of ConversationBufferMemory
+        await asyncio.sleep(0.1)
+        
+    async def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        self.usage_count += 1
+        transcription = data.get("transcription", "")
+        # Simulate planning
+        await asyncio.sleep(0.3)
+        return {
+            "plan": {
+                "steps": ["analyze", "search", "synthesize", "respond"],
+                "intent": "information_request",
+                "complexity": "medium"
+            }
+        }
+        
+    async def cleanup(self) -> None:
+        logger.info(f"Cleaning up MockPlannerAgent {self.agent_id}")
+        
+    async def reset(self) -> None:
+        """Reset memory between uses"""
+        if self.memory:
+            self.memory.clear()
+
+
+class MockInsightAgent(BasePooledAgent):
+    """Mock insight agent for testing"""
+    
+    async def initialize(self) -> None:
+        logger.info(f"Initializing MockInsightAgent {self.agent_id}")
+        await asyncio.sleep(0.1)
+        
+    async def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        self.usage_count += 1
+        context = data.get("context", {})
+        # Simulate insight generation
+        await asyncio.sleep(0.4)
+        return {
+            "insights": [
+                {"type": "pattern", "description": "User prefers concise answers"},
+                {"type": "recommendation", "description": "Use bullet points"}
+            ]
+        }
+        
+    async def cleanup(self) -> None:
+        logger.info(f"Cleaning up MockInsightAgent {self.agent_id}")
 
 
 class AgentPool:
-    """
-    Manages a pool of agent instances with load balancing and lifecycle management.
-    """
+    """Pool manager for LangChain agents"""
     
-    def __init__(
-        self,
-        gemini_api_key: str,
-        config: Dict[str, Any],
-        min_instances_per_type: int = 1,
-        max_instances_per_type: int = 5,
-        idle_timeout: int = 300,  # 5 minutes
-        cleanup_interval: int = 60   # 1 minute
-    ):
-        self.gemini_api_key = gemini_api_key
-        self.config = config
-        self.min_instances_per_type = min_instances_per_type
-        self.max_instances_per_type = max_instances_per_type
-        self.idle_timeout = idle_timeout
-        self.cleanup_interval = cleanup_interval
+    def __init__(self):
+        self.pools: Dict[str, List[AgentInstance]] = defaultdict(list)
+        self.agent_configs: Dict[str, Dict[str, Any]] = {}
+        self.agent_classes: Dict[str, Type[BasePooledAgent]] = {}
+        self.min_pool_size: Dict[str, int] = {}
+        self.max_pool_size: Dict[str, int] = {}
+        self._lock = asyncio.Lock()
+        self._condition = asyncio.Condition()
+        self.statistics: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
+            "total_created": 0,
+            "total_acquired": 0,
+            "total_released": 0,
+            "current_busy": 0,
+            "current_available": 0
+        })
         
-        self.logger = logging.getLogger(__name__)
+        # Register default agent types
+        self._register_default_agents()
         
-        # Agent registry and pools
-        self._agents: Dict[str, AgentInstance] = {}
-        self._agent_pools: Dict[AgentType, List[str]] = defaultdict(list)
-        self._agent_classes: Dict[AgentType, Type[BaseAgent]] = {
-            AgentType.PLANNER: PlannerAgent,
-            AgentType.VOICE: VoiceAgent,
-            AgentType.VISION: VisionAgent,
-            AgentType.CONTEXT: ContextAgent,
-            AgentType.MEMORY: MemoryAgent,
-            AgentType.INSIGHT: InsightAgent,
-            AgentType.RESPONSE: ResponseAgent,
-        }
-        
-        # Load balancing and monitoring
-        self._round_robin_counters: Dict[AgentType, int] = defaultdict(int)
-        self._request_queue: Dict[AgentType, asyncio.Queue] = {
-            agent_type: asyncio.Queue() for agent_type in AgentType
-        }
-        
-        # Statistics
-        self._stats = {
-            "total_requests": 0,
-            "successful_requests": 0,
-            "failed_requests": 0,
-            "agents_created": 0,
-            "agents_destroyed": 0,
-        }
-        
-        # Background tasks
-        self._cleanup_task: Optional[asyncio.Task] = None
-        self._monitoring_task: Optional[asyncio.Task] = None
-        self._shutdown_event = asyncio.Event()
-        
-        # Weak references to avoid memory leaks
-        self._weak_agents = weakref.WeakSet()
-        
-        # Initialize the pool
-        asyncio.create_task(self._initialize_pool())
-    
-    async def _initialize_pool(self):
-        """Initialize the agent pool with minimum instances."""
-        self.logger.info("Initializing agent pool...")
-        
-        # Create minimum instances for each agent type
-        for agent_type in AgentType:
-            for _ in range(self.min_instances_per_type):
-                await self._create_agent_instance(agent_type)
-        
-        # Start background tasks
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-        self._monitoring_task = asyncio.create_task(self._monitoring_loop())
-        
-        self.logger.info(f"Agent pool initialized with {len(self._agents)} agents")
-    
-    async def _create_agent_instance(self, agent_type: AgentType) -> str:
-        """Create a new agent instance of the specified type."""
-        try:
-            agent_class = self._agent_classes[agent_type]
-            
-            # Create agent with configuration
-            agent_config = self.config.get(agent_type.value, {})
-            agent_config["gemini_api_key"] = self.gemini_api_key
-            
-            agent = agent_class(**agent_config)
-            await agent.initialize()
-            
-            # Create instance wrapper
-            instance_id = f"{agent_type.value}_{len(self._agents)}"
-            instance = AgentInstance(
-                id=instance_id,
-                agent_type=agent_type,
-                agent=agent,
-                metadata={"config": agent_config}
-            )
-            
-            # Register instance
-            self._agents[instance_id] = instance
-            self._agent_pools[agent_type].append(instance_id)
-            self._weak_agents.add(instance)
-            
-            self._stats["agents_created"] += 1
-            
-            self.logger.debug(f"Created {agent_type.value} agent: {instance_id}")
-            return instance_id
-            
-        except Exception as e:
-            self.logger.error(f"Failed to create {agent_type.value} agent: {e}")
-            raise
-    
-    async def _destroy_agent_instance(self, instance_id: str):
-        """Destroy an agent instance and cleanup resources."""
-        if instance_id not in self._agents:
-            return
-        
-        instance = self._agents[instance_id]
-        
-        try:
-            # Cleanup agent resources
-            await instance.agent.cleanup()
-            
-            # Remove from pools
-            self._agent_pools[instance.agent_type].remove(instance_id)
-            del self._agents[instance_id]
-            
-            self._stats["agents_destroyed"] += 1
-            
-            self.logger.debug(f"Destroyed agent instance: {instance_id}")
-            
-        except Exception as e:
-            self.logger.error(f"Error destroying agent {instance_id}: {e}")
-    
-    async def get_agent(self, agent_type: AgentType) -> BaseAgent:
-        """
-        Get an available agent instance of the specified type.
-        
-        Args:
-            agent_type: Type of agent to retrieve
-            
-        Returns:
-            BaseAgent: An available agent instance
-            
-        Raises:
-            RuntimeError: If no agents are available and pool is at capacity
-        """
-        self._stats["total_requests"] += 1
-        
-        try:
-            # Get an available instance
-            instance = await self._get_available_instance(agent_type)
-            
-            if instance:
-                # Mark as busy and update usage
-                instance.is_busy = True
-                instance.last_used = datetime.now()
-                instance.usage_count += 1
-                
-                self._stats["successful_requests"] += 1
-                return instance.agent
-            else:
-                # Try to create a new instance if under capacity
-                if len(self._agent_pools[agent_type]) < self.max_instances_per_type:
-                    instance_id = await self._create_agent_instance(agent_type)
-                    instance = self._agents[instance_id]
-                    instance.is_busy = True
-                    instance.last_used = datetime.now()
-                    instance.usage_count += 1
-                    
-                    self._stats["successful_requests"] += 1
-                    return instance.agent
-                else:
-                    # Wait for an agent to become available
-                    return await self._wait_for_available_agent(agent_type)
-                    
-        except Exception as e:
-            self._stats["failed_requests"] += 1
-            self.logger.error(f"Failed to get {agent_type.value} agent: {e}")
-            raise
-    
-    async def _get_available_instance(self, agent_type: AgentType) -> Optional[AgentInstance]:
-        """Get an available agent instance using round-robin load balancing."""
-        pool = self._agent_pools[agent_type]
-        
-        if not pool:
-            return None
-        
-        # Round-robin selection starting from last counter position
-        start_idx = self._round_robin_counters[agent_type] % len(pool)
-        
-        for i in range(len(pool)):
-            idx = (start_idx + i) % len(pool)
-            instance_id = pool[idx]
-            instance = self._agents[instance_id]
-            
-            if not instance.is_busy:
-                self._round_robin_counters[agent_type] = idx + 1
-                return instance
-        
-        return None  # All instances are busy
-    
-    async def _wait_for_available_agent(self, agent_type: AgentType, timeout: float = 30.0) -> BaseAgent:
-        """Wait for an agent to become available."""
-        start_time = datetime.now()
-        
-        while (datetime.now() - start_time).total_seconds() < timeout:
-            instance = await self._get_available_instance(agent_type)
-            if instance:
-                instance.is_busy = True
-                instance.last_used = datetime.now()
-                instance.usage_count += 1
-                return instance.agent
-            
-            await asyncio.sleep(0.1)  # Small delay before retrying
-        
-        raise TimeoutError(f"No {agent_type.value} agents available within timeout")
-    
-    async def release_agent(self, agent: BaseAgent):
-        """
-        Release an agent back to the pool.
-        
-        Args:
-            agent: The agent instance to release
-        """
-        # Find the instance wrapper
-        for instance in self._agents.values():
-            if instance.agent is agent:
-                instance.is_busy = False
-                instance.current_task_id = None
-                self.logger.debug(f"Released agent: {instance.id}")
-                break
-    
-    async def _cleanup_loop(self):
-        """Background task to cleanup idle agents."""
-        while not self._shutdown_event.is_set():
-            try:
-                await self._cleanup_idle_agents()
-                await asyncio.sleep(self.cleanup_interval)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self.logger.error(f"Error in cleanup loop: {e}")
-    
-    async def _cleanup_idle_agents(self):
-        """Remove agents that have been idle for too long."""
-        current_time = datetime.now()
-        agents_to_remove = []
-        
-        for agent_type, pool in self._agent_pools.items():
-            # Keep minimum instances
-            if len(pool) <= self.min_instances_per_type:
-                continue
-            
-            # Find idle agents
-            for instance_id in pool:
-                instance = self._agents[instance_id]
-                
-                if (not instance.is_busy and 
-                    (current_time - instance.last_used).total_seconds() > self.idle_timeout):
-                    agents_to_remove.append(instance_id)
-        
-        # Remove idle agents
-        for instance_id in agents_to_remove:
-            await self._destroy_agent_instance(instance_id)
-    
-    async def _monitoring_loop(self):
-        """Background task for monitoring pool health and performance."""
-        while not self._shutdown_event.is_set():
-            try:
-                await self._update_pool_metrics()
-                await asyncio.sleep(30)  # Update metrics every 30 seconds
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self.logger.error(f"Error in monitoring loop: {e}")
-    
-    async def _update_pool_metrics(self):
-        """Update pool performance metrics."""
-        total_agents = len(self._agents)
-        active_agents = sum(1 for instance in self._agents.values() if instance.is_busy)
-        
-        if total_agents > 0:
-            pool_efficiency = active_agents / total_agents
-        else:
-            pool_efficiency = 0.0
-        
-        # Log metrics if efficiency is low
-        if pool_efficiency < 0.3 and total_agents > self.min_instances_per_type:
-            self.logger.warning(f"Low pool efficiency: {pool_efficiency:.2%}")
-    
-    def get_pool_stats(self) -> PoolStats:
-        """Get current pool statistics."""
-        total_agents = len(self._agents)
-        active_agents = sum(1 for instance in self._agents.values() if instance.is_busy)
-        idle_agents = total_agents - active_agents
-        
-        agent_counts = defaultdict(int)
-        total_usage = 0
-        
-        for instance in self._agents.values():
-            agent_counts[instance.agent_type.value] += 1
-            total_usage += instance.usage_count
-        
-        average_usage = total_usage / total_agents if total_agents > 0 else 0
-        pool_efficiency = active_agents / total_agents if total_agents > 0 else 0
-        
-        return PoolStats(
-            total_agents=total_agents,
-            active_agents=active_agents,
-            idle_agents=idle_agents,
-            agent_counts_by_type=dict(agent_counts),
-            average_usage=average_usage,
-            total_requests=self._stats["total_requests"],
-            pool_efficiency=pool_efficiency
+    def _register_default_agents(self):
+        """Register default agent types"""
+        self.register_agent_type(
+            "voice_agent",
+            MockVoiceAgent,
+            min_size=1,
+            max_size=3
         )
-    
-    def get_agent_details(self, agent_type: Optional[AgentType] = None) -> List[Dict[str, Any]]:
-        """Get detailed information about agents in the pool."""
-        agents = []
+        self.register_agent_type(
+            "planner_agent",
+            MockPlannerAgent,
+            min_size=2,
+            max_size=5
+        )
+        self.register_agent_type(
+            "insight_agent",
+            MockInsightAgent,
+            min_size=1,
+            max_size=3
+        )
         
-        for instance in self._agents.values():
-            if agent_type is None or instance.agent_type == agent_type:
-                agents.append({
-                    "id": instance.id,
-                    "type": instance.agent_type.value,
-                    "created_at": instance.created_at.isoformat(),
-                    "last_used": instance.last_used.isoformat(),
-                    "usage_count": instance.usage_count,
-                    "is_busy": instance.is_busy,
-                    "current_task_id": instance.current_task_id,
-                    "metadata": instance.metadata
-                })
+    def register_agent_type(
+        self,
+        agent_type: str,
+        agent_class: Type[BasePooledAgent],
+        min_size: int = 1,
+        max_size: int = 5,
+        config: Optional[Dict[str, Any]] = None
+    ):
+        """Register a new agent type"""
+        self.agent_classes[agent_type] = agent_class
+        self.min_pool_size[agent_type] = min_size
+        self.max_pool_size[agent_type] = max_size
+        self.agent_configs[agent_type] = config or {}
+        logger.info(f"Registered agent type: {agent_type}")
         
-        return agents
-    
-    async def scale_pool(self, agent_type: AgentType, target_count: int):
-        """
-        Scale the pool for a specific agent type.
+    async def initialize(self):
+        """Initialize all agent pools"""
+        logger.info("Initializing agent pools...")
         
-        Args:
-            agent_type: Type of agent to scale
-            target_count: Target number of instances
-        """
-        current_count = len(self._agent_pools[agent_type])
+        # Create minimum number of agents for each type
+        for agent_type in self.agent_classes:
+            min_size = self.min_pool_size[agent_type]
+            for _ in range(min_size):
+                await self._create_agent(agent_type)
+                
+        logger.info("Agent pools initialized")
         
-        if target_count > current_count:
-            # Scale up
-            for _ in range(target_count - current_count):
-                if len(self._agent_pools[agent_type]) < self.max_instances_per_type:
-                    await self._create_agent_instance(agent_type)
-                else:
-                    break
-        elif target_count < current_count:
-            # Scale down (but respect minimum)
-            target_count = max(target_count, self.min_instances_per_type)
-            instances_to_remove = current_count - target_count
+    async def _create_agent(self, agent_type: str) -> AgentInstance:
+        """Create a new agent instance"""
+        if agent_type not in self.agent_classes:
+            raise ValueError(f"Unknown agent type: {agent_type}")
             
-            # Remove idle instances first
-            pool = self._agent_pools[agent_type]
-            for i in range(instances_to_remove):
-                for instance_id in pool[:]:  # Copy to avoid modification during iteration
-                    instance = self._agents[instance_id]
-                    if not instance.is_busy:
-                        await self._destroy_agent_instance(instance_id)
-                        break
-    
+        agent_class = self.agent_classes[agent_type]
+        agent_id = str(uuid.uuid4())
+        
+        # Create the agent
+        agent = agent_class(agent_id)
+        await agent.initialize()
+        
+        # Create instance wrapper
+        instance = AgentInstance(
+            id=agent_id,
+            agent_type=agent_type,
+            agent=agent,
+            status="available"
+        )
+        
+        # Add to pool
+        async with self._lock:
+            self.pools[agent_type].append(instance)
+            self.statistics[agent_type]["total_created"] += 1
+            self.statistics[agent_type]["current_available"] += 1
+            
+        logger.info(f"Created new {agent_type} agent: {agent_id}")
+        return instance
+        
+    async def acquire(self, agent_type: str, timeout: float = 30.0) -> Any:
+        """Acquire an agent from the pool"""
+        if agent_type not in self.agent_classes:
+            raise ValueError(f"Unknown agent type: {agent_type}")
+            
+        start_time = asyncio.get_event_loop().time()
+        
+        async with self._condition:
+            while True:
+                # Check for available agents
+                available_agent = None
+                async with self._lock:
+                    pool = self.pools[agent_type]
+                    for instance in pool:
+                        if instance.status == "available":
+                            instance.status = "busy"
+                            instance.last_used_at = datetime.now()
+                            instance.usage_count += 1
+                            available_agent = instance
+                            self.statistics[agent_type]["total_acquired"] += 1
+                            self.statistics[agent_type]["current_busy"] += 1
+                            self.statistics[agent_type]["current_available"] -= 1
+                            break
+                            
+                if available_agent:
+                    logger.info(f"Acquired {agent_type} agent: {available_agent.id}")
+                    return available_agent.agent
+                    
+                # Check if we can create a new agent
+                async with self._lock:
+                    current_size = len(self.pools[agent_type])
+                    max_size = self.max_pool_size[agent_type]
+                    
+                if current_size < max_size:
+                    # Create a new agent
+                    instance = await self._create_agent(agent_type)
+                    async with self._lock:
+                        instance.status = "busy"
+                        instance.last_used_at = datetime.now()
+                        instance.usage_count += 1
+                        self.statistics[agent_type]["total_acquired"] += 1
+                        self.statistics[agent_type]["current_busy"] += 1
+                        self.statistics[agent_type]["current_available"] -= 1
+                    logger.info(f"Created and acquired new {agent_type} agent: {instance.id}")
+                    return instance.agent
+                    
+                # Wait for an agent to become available
+                elapsed = asyncio.get_event_loop().time() - start_time
+                if elapsed >= timeout:
+                    raise TimeoutError(f"Timeout waiting for {agent_type} agent")
+                    
+                try:
+                    await asyncio.wait_for(
+                        self._condition.wait(),
+                        timeout=timeout - elapsed
+                    )
+                except asyncio.TimeoutError:
+                    raise TimeoutError(f"Timeout waiting for {agent_type} agent")
+                    
+    async def release(self, agent_type: str, agent: Any) -> None:
+        """Release an agent back to the pool"""
+        if not isinstance(agent, BasePooledAgent):
+            logger.warning(f"Attempted to release non-pooled agent: {agent}")
+            return
+            
+        async with self._lock:
+            pool = self.pools[agent_type]
+            for instance in pool:
+                if instance.agent == agent:
+                    # Reset the agent
+                    await agent.reset()
+                    
+                    # Mark as available
+                    instance.status = "available"
+                    instance.current_task_id = None
+                    self.statistics[agent_type]["total_released"] += 1
+                    self.statistics[agent_type]["current_busy"] -= 1
+                    self.statistics[agent_type]["current_available"] += 1
+                    
+                    logger.info(f"Released {agent_type} agent: {instance.id}")
+                    break
+                    
+        # Notify waiting tasks
+        async with self._condition:
+            self._condition.notify()
+            
+    async def get_pool_stats(self) -> Dict[str, Any]:
+        """Get statistics for all pools"""
+        stats = {}
+        async with self._lock:
+            for agent_type, pool in self.pools.items():
+                type_stats = self.statistics[agent_type].copy()
+                type_stats["pool_size"] = len(pool)
+                type_stats["min_size"] = self.min_pool_size[agent_type]
+                type_stats["max_size"] = self.max_pool_size[agent_type]
+                
+                # Calculate average usage
+                if pool:
+                    total_usage = sum(instance.usage_count for instance in pool)
+                    type_stats["average_usage"] = total_usage / len(pool)
+                else:
+                    type_stats["average_usage"] = 0
+                    
+                stats[agent_type] = type_stats
+                
+        return stats
+        
+    async def cleanup(self):
+        """Cleanup all agent pools"""
+        logger.info("Cleaning up agent pools...")
+        
+        async with self._lock:
+            for agent_type, pool in self.pools.items():
+                for instance in pool:
+                    if instance.agent:
+                        await instance.agent.cleanup()
+                        
+            self.pools.clear()
+            
+        logger.info("Agent pools cleaned up")
+        
     async def health_check(self) -> Dict[str, Any]:
-        """Perform a health check on all agents in the pool."""
-        results = {
-            "healthy_agents": 0,
-            "unhealthy_agents": 0,
-            "agent_health": {}
+        """Perform health check on all pools"""
+        health = {
+            "status": "healthy",
+            "pools": {},
+            "issues": []
         }
         
-        for instance in self._agents.values():
-            try:
-                # Perform health check on agent
-                health = await instance.agent.health_check()
-                results["agent_health"][instance.id] = health
-                
-                if health.get("status") == "healthy":
-                    results["healthy_agents"] += 1
-                else:
-                    results["unhealthy_agents"] += 1
-                    
-            except Exception as e:
-                results["unhealthy_agents"] += 1
-                results["agent_health"][instance.id] = {
-                    "status": "error",
-                    "error": str(e)
+        async with self._lock:
+            for agent_type, pool in self.pools.items():
+                pool_health = {
+                    "size": len(pool),
+                    "available": sum(1 for i in pool if i.status == "available"),
+                    "busy": sum(1 for i in pool if i.status == "busy"),
+                    "error": sum(1 for i in pool if i.status == "error")
                 }
+                
+                # Check for issues
+                if pool_health["error"] > 0:
+                    health["issues"].append(f"{agent_type} has {pool_health['error']} agents in error state")
+                    
+                if pool_health["size"] < self.min_pool_size[agent_type]:
+                    health["issues"].append(f"{agent_type} pool size below minimum")
+                    
+                health["pools"][agent_type] = pool_health
+                
+        if health["issues"]:
+            health["status"] = "degraded"
+            
+        return health
+
+
+# Test function
+async def test_agent_pool():
+    """Test the agent pool independently"""
+    pool = AgentPool()
+    
+    # Initialize pools
+    await pool.initialize()
+    
+    # Get initial stats
+    stats = await pool.get_pool_stats()
+    print(f"Initial pool stats: {stats}")
+    
+    # Test acquiring and releasing agents
+    agents = []
+    agent_types = ["voice_agent", "planner_agent", "insight_agent"]
+    
+    # Acquire multiple agents
+    for agent_type in agent_types:
+        agent = await pool.acquire(agent_type)
+        agents.append((agent_type, agent))
+        print(f"Acquired {agent_type}")
+        
+    # Use the agents
+    for agent_type, agent in agents:
+        result = await agent.process({"test": "data"})
+        print(f"{agent_type} result: {result}")
+        
+    # Release agents
+    for agent_type, agent in agents:
+        await pool.release(agent_type, agent)
+        print(f"Released {agent_type}")
+        
+    # Test concurrent acquisition
+    async def acquire_and_use(pool, agent_type, duration):
+        agent = await pool.acquire(agent_type)
+        await asyncio.sleep(duration)
+        await pool.release(agent_type, agent)
+        
+    # Create concurrent tasks
+    tasks = []
+    for i in range(10):
+        agent_type = agent_types[i % len(agent_types)]
+        task = asyncio.create_task(acquire_and_use(pool, agent_type, 0.5))
+        tasks.append(task)
+        
+    # Wait for all tasks
+    await asyncio.gather(*tasks)
+    
+    # Final stats
+    final_stats = await pool.get_pool_stats()
+    print(f"Final pool stats: {final_stats}")
+    
+    # Health check
+    health = await pool.health_check()
+    print(f"Health check: {health}")
+    
+    # Cleanup
+    await pool.cleanup()
+
+
+if __name__ == "__main__":
+    asyncio.run(test_agent_pool())
