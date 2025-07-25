@@ -1,7 +1,7 @@
-from abc import ABC, abstractmethod
+from google.adk.agents import BaseAgent
+from abc import abstractmethod
 
-class BaseAgent(ABC):
+class MyBaseAgent(BaseAgent):
     @abstractmethod
-    def run(self, input_data: str) -> str:
-        """Runs the agent logic and returns a string output."""
+    def run(self, input: str) -> str:
         pass
