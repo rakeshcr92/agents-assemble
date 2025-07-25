@@ -1,18 +1,15 @@
-"""
-Async task management system with priority queues, retry logic, and monitoring.
-Handles distributed task execution across multiple agents.
-"""
-
 import asyncio
-import logging
-from typing import Dict, List, Optional, Any, Callable, Union
-from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional, Callable
 from dataclasses import dataclass, field
+from datetime import datetime
+from collections import deque
 from enum import Enum
+import logging
 import uuid
-import json
-from collections import defaultdict
-import time
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class TaskStatus(Enum):
@@ -20,484 +17,343 @@ class TaskStatus(Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
-    CANCELLED = "cancelled"
     RETRYING = "retrying"
-
-
-class TaskPriority(Enum):
-    LOW = 1
-    NORMAL = 2
-    HIGH = 3
-    URGENT = 4
 
 
 @dataclass
 class Task:
-    """Represents a task in the queue."""
-    id: str
-    task_type: str
-    data: Dict[str, Any]
-    callback: Optional[Callable] = None
-    priority: TaskPriority = TaskPriority.NORMAL
-    max_retries: int = 3
-    retry_delay: float = 1.0
-    timeout: Optional[float] = None
+    """Represents a task in the queue"""
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    type: str = ""
+    data: Dict[str, Any] = field(default_factory=dict)
+    priority: int = 1
     created_at: datetime = field(default_factory=datetime.now)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     status: TaskStatus = TaskStatus.PENDING
     retries: int = 0
+    max_retries: int = 3
+    result: Optional[Any] = None
     error: Optional[str] = None
-    result: Any = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    dependencies: List[str] = field(default_factory=list)
-    tags: List[str] = field(default_factory=list)
+    callback_handler: Optional['TaskQueueCallback'] = None
 
 
-@dataclass
-class TaskResult:
-    """Result of task execution."""
-    task_id: str
-    success: bool
-    result: Any = None
-    error: Optional[str] = None
-    execution_time: float = 0.0
-    metadata: Dict[str, Any] = field(default_factory=dict)
+class TaskQueueCallback:
+    """Callback handler for task execution tracking"""
+    
+    def __init__(self, task_queue: 'TaskQueue', task: Task):
+        self.task_queue = task_queue
+        self.task = task
+        
+    async def on_chain_start(self, serialized: Dict[str, Any], inputs: Dict[str, Any], **kwargs) -> None:
+        """Called when a chain starts running."""
+        logger.info(f"Task {self.task.id} chain started")
+        self.task.status = TaskStatus.RUNNING
+        self.task.started_at = datetime.now()
+        
+    async def on_chain_end(self, outputs: Dict[str, Any], **kwargs) -> None:
+        """Called when a chain ends running."""
+        logger.info(f"Task {self.task.id} chain completed")
+        self.task.status = TaskStatus.COMPLETED
+        self.task.completed_at = datetime.now()
+        self.task.result = outputs
+        
+    async def on_chain_error(self, error: Exception, **kwargs) -> None:
+        """Called when a chain errors."""
+        logger.error(f"Task {self.task.id} chain error: {str(error)}")
+        self.task.status = TaskStatus.FAILED
+        self.task.error = str(error)
+        
+        # Handle retry logic
+        if self.task.retries < self.task.max_retries:
+            self.task.retries += 1
+            self.task.status = TaskStatus.RETRYING
+            await self.task_queue.enqueue(self.task)
+
+
+class PriorityQueue:
+    """Simple priority queue implementation"""
+    
+    def __init__(self):
+        self.queues = {1: deque(), 2: deque(), 3: deque()}  # 3 priority levels
+        self.lock = asyncio.Lock()
+        
+    async def put(self, task: Task):
+        """Add a task to the queue"""
+        async with self.lock:
+            priority = min(max(task.priority, 1), 3)  # Clamp between 1-3
+            self.queues[priority].append(task)
+            
+    async def get(self) -> Optional[Task]:
+        """Get the highest priority task"""
+        async with self.lock:
+            # Check from highest priority (3) to lowest (1)
+            for priority in [3, 2, 1]:
+                if self.queues[priority]:
+                    return self.queues[priority].popleft()
+            return None
+            
+    async def size(self) -> int:
+        """Get total queue size"""
+        async with self.lock:
+            return sum(len(q) for q in self.queues.values())
+            
+    def empty(self) -> bool:
+        """Check if queue is empty"""
+        return all(len(q) == 0 for q in self.queues.values())
 
 
 class TaskQueue:
-    """
-    Async task queue with priority handling, retry logic, and dependency management.
-    """
+    """Task queue implementation for LangChain agents"""
     
-    def __init__(
-        self,
-        max_workers: int = 10,
-        max_queue_size: int = 1000,
-        default_timeout: float = 300.0
-    ):
-        self.max_workers = max_workers
-        self.max_queue_size = max_queue_size
-        self.default_timeout = default_timeout
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, max_concurrent_tasks: int = 5):
+        self.queue = PriorityQueue()
+        self.max_concurrent_tasks = max_concurrent_tasks
+        self.running_tasks: Dict[str, Task] = {}
+        self.completed_tasks: Dict[str, Task] = {}
+        self.workers: List[asyncio.Task] = []
+        self.is_running = False
+        self.event_bus = None  # Will be injected
+        self.agent_pool = None  # Will be injected
         
-        # Priority queues for different task types
-        self._queues: Dict[TaskPriority, asyncio.Queue] = {
-            priority: asyncio.Queue(maxsize=max_queue_size)
-            for priority in TaskPriority
-        }
+    async def start(self, num_workers: int = 3):
+        """Start the task queue workers"""
+        self.is_running = True
+        logger.info(f"Starting task queue with {num_workers} workers")
         
-        # Task registry for tracking all tasks
-        self._tasks: Dict[str, Task] = {}
-        self._task_results: Dict[str, TaskResult] = {}
-        
-        # Worker management
-        self._workers: List[asyncio.Task] = []
-        self._worker_semaphore = asyncio.Semaphore(max_workers)
-        self._shutdown_event = asyncio.Event()
-        
-        # Dependency tracking
-        self._task_dependencies: Dict[str, List[str]] = defaultdict(list)
-        self._dependent_tasks: Dict[str, List[str]] = defaultdict(list)
-        
-        # Statistics and monitoring
-        self._stats = {
-            "tasks_submitted": 0,
-            "tasks_completed": 0,
-            "tasks_failed": 0,
-            "tasks_cancelled": 0,
-            "total_execution_time": 0.0,
-            "average_execution_time": 0.0
-        }
-        
-        # Performance metrics
-        self._performance_history: List[Dict[str, Any]] = []
-        self._max_history_size = 1000
-        
-        # Start worker pool
-        self._start_workers()
-    
-    def _start_workers(self):
-        """Start the worker pool for processing tasks."""
-        for i in range(self.max_workers):
+        # Create worker tasks
+        for i in range(num_workers):
             worker = asyncio.create_task(self._worker(f"worker-{i}"))
-            self._workers.append(worker)
-    
-    async def _worker(self, worker_id: str):
-        """Worker coroutine that processes tasks from priority queues."""
-        self.logger.debug(f"Started worker {worker_id}")
+            self.workers.append(worker)
+            
+    async def stop(self):
+        """Stop the task queue"""
+        logger.info("Stopping task queue...")
+        self.is_running = False
         
-        while not self._shutdown_event.is_set():
+        # Cancel all workers
+        for worker in self.workers:
+            worker.cancel()
+            
+        # Wait for workers to finish
+        await asyncio.gather(*self.workers, return_exceptions=True)
+        self.workers.clear()
+        
+    async def enqueue(self, task: Task) -> str:
+        """Add a task to the queue"""
+        if not isinstance(task, Task):
+            raise ValueError("task must be an instance of Task")
+            
+        # Set callback handler
+        task.callback_handler = TaskQueueCallback(self, task)
+        
+        await self.queue.put(task)
+        logger.info(f"Enqueued task {task.id} of type {task.type} with priority {task.priority}")
+        
+        # Emit event if event bus is available
+        if self.event_bus:
+            await self.event_bus.publish({
+                "type": "TASK_CREATED",
+                "data": {
+                    "task_id": task.id,
+                    "task_type": task.type,
+                    "priority": task.priority
+                }
+            })
+            
+        return task.id
+        
+    async def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Get the status of a task"""
+        # Check running tasks
+        if task_id in self.running_tasks:
+            task = self.running_tasks[task_id]
+            return {
+                "id": task.id,
+                "status": task.status.value,
+                "type": task.type,
+                "started_at": task.started_at.isoformat() if task.started_at else None
+            }
+            
+        # Check completed tasks
+        if task_id in self.completed_tasks:
+            task = self.completed_tasks[task_id]
+            return {
+                "id": task.id,
+                "status": task.status.value,
+                "type": task.type,
+                "result": task.result,
+                "completed_at": task.completed_at.isoformat() if task.completed_at else None
+            }
+            
+        return None
+        
+    async def _worker(self, worker_id: str):
+        """Worker coroutine that processes tasks from the queue"""
+        logger.info(f"Worker {worker_id} started")
+        
+        while self.is_running:
             try:
-                # Get next task from highest priority queue
-                task = await self._get_next_task()
-                if task is None:
+                # Check if we can run more tasks
+                if len(self.running_tasks) >= self.max_concurrent_tasks:
+                    await asyncio.sleep(0.1)
                     continue
-                
-                # Acquire worker semaphore
-                async with self._worker_semaphore:
-                    await self._execute_task(task, worker_id)
                     
+                # Get a task from the queue
+                task = await self.queue.get()
+                if not task:
+                    await asyncio.sleep(0.1)
+                    continue
+                    
+                # Process the task
+                logger.info(f"Worker {worker_id} processing task {task.id}")
+                self.running_tasks[task.id] = task
+                
+                try:
+                    # Execute the task based on its type
+                    result = await self._execute_task(task)
+                    task.result = result
+                    task.status = TaskStatus.COMPLETED
+                    task.completed_at = datetime.now()
+                    
+                    # Move to completed
+                    self.completed_tasks[task.id] = task
+                    del self.running_tasks[task.id]
+                    
+                    # Emit completion event
+                    if self.event_bus:
+                        await self.event_bus.publish({
+                            "type": "TASK_COMPLETED",
+                            "data": {
+                                "task_id": task.id,
+                                "task_type": task.type,
+                                "result": result
+                            }
+                        })
+                        
+                except Exception as e:
+                    logger.error(f"Task {task.id} failed: {str(e)}")
+                    task.error = str(e)
+                    task.status = TaskStatus.FAILED
+                    
+                    # Handle retry
+                    if task.retries < task.max_retries:
+                        task.retries += 1
+                        task.status = TaskStatus.RETRYING
+                        await self.enqueue(task)
+                        logger.info(f"Retrying task {task.id} (attempt {task.retries})")
+                    else:
+                        # Move to completed with failed status
+                        self.completed_tasks[task.id] = task
+                        
+                    del self.running_tasks[task.id]
+                    
+                    # Emit failure event
+                    if self.event_bus:
+                        await self.event_bus.publish({
+                            "type": "TASK_FAILED",
+                            "data": {
+                                "task_id": task.id,
+                                "task_type": task.type,
+                                "error": str(e),
+                                "retries": task.retries
+                            }
+                        })
+                        
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self.logger.error(f"Worker {worker_id} error: {e}")
-                await asyncio.sleep(1)  # Brief pause before retrying
+                logger.error(f"Worker {worker_id} error: {str(e)}")
+                await asyncio.sleep(1)
+                
+        logger.info(f"Worker {worker_id} stopped")
         
-        self.logger.debug(f"Worker {worker_id} stopped")
-    
-    async def _get_next_task(self) -> Optional[Task]:
-        """Get the next task to execute, checking dependencies."""
-        # Check queues in priority order (highest first)
-        for priority in sorted(TaskPriority, key=lambda x: x.value, reverse=True):
-            queue = self._queues[priority]
-            
-            if not queue.empty():
-                try:
-                    task = await asyncio.wait_for(queue.get(), timeout=1.0)
-                    
-                    # Check if dependencies are satisfied
-                    if self._are_dependencies_satisfied(task):
-                        return task
-                    else:
-                        # Re-queue if dependencies not met
-                        await queue.put(task)
-                        
-                except asyncio.TimeoutError:
-                    continue
+    async def _execute_task(self, task: Task) -> Any:
+        """Execute a task based on its type"""
+        logger.info(f"Executing task {task.id} of type {task.type}")
         
-        return None
-    
-    def _are_dependencies_satisfied(self, task: Task) -> bool:
-        """Check if all task dependencies have completed successfully."""
-        if not task.dependencies:
-            return True
+        # Simulate task execution based on type
+        # In real implementation, this would call the appropriate agent
         
-        for dep_id in task.dependencies:
-            if dep_id not in self._task_results:
-                return False
+        if task.type == "voice_agent":
+            # Simulate voice processing
+            await asyncio.sleep(1)
+            return {"transcription": "Simulated transcription"}
             
-            result = self._task_results[dep_id]
-            if not result.success:
-                # Dependency failed, mark this task as failed too
-                task.status = TaskStatus.FAILED
-                task.error = f"Dependency {dep_id} failed"
-                return False
-        
-        return True
-    
-    async def _execute_task(self, task: Task, worker_id: str):
-        """Execute a single task with error handling and retry logic."""
-        task.status = TaskStatus.RUNNING
-        task.started_at = datetime.now()
-        
-        start_time = time.time()
-        
-        try:
-            # Apply timeout if specified
-            timeout = task.timeout or self.default_timeout
-            
-            # Execute the task callback
-            if task.callback:
-                if asyncio.iscoroutinefunction(task.callback):
-                    result = await asyncio.wait_for(
-                        task.callback(task.data),
-                        timeout=timeout
-                    )
-                else:
-                    result = await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(
-                            None, task.callback, task.data
-                        ),
-                        timeout=timeout
-                    )
-            else:
-                result = task.data  # No callback, just return data
-            
-            # Task completed successfully
-            execution_time = time.time() - start_time
-            task.status = TaskStatus.COMPLETED
-            task.completed_at = datetime.now()
-            task.result = result
-            
-            # Store result
-            task_result = TaskResult(
-                task_id=task.id,
-                success=True,
-                result=result,
-                execution_time=execution_time,
-                metadata={"worker_id": worker_id}
-            )
-            self._task_results[task.id] = task_result
-            
-            # Update statistics
-            self._stats["tasks_completed"] += 1
-            self._stats["total_execution_time"] += execution_time
-            self._stats["average_execution_time"] = (
-                self._stats["total_execution_time"] / self._stats["tasks_completed"]
-            )
-            
-            # Process dependent tasks
-            await self._process_dependent_tasks(task.id)
-            
-            self.logger.debug(f"Task {task.id} completed by {worker_id} in {execution_time:.2f}s")
-            
-        except asyncio.TimeoutError:
-            await self._handle_task_failure(task, "Task timed out", worker_id)
-        except asyncio.CancelledError:
-            task.status = TaskStatus.CANCELLED
-            self._stats["tasks_cancelled"] += 1
-            raise
-        except Exception as e:
-            await self._handle_task_failure(task, str(e), worker_id)
-    
-    async def _handle_task_failure(self, task: Task, error: str, worker_id: str):
-        """Handle task failure with retry logic."""
-        task.error = error
-        task.retries += 1
-        
-        if task.retries <= task.max_retries:
-            # Retry the task
-            task.status = TaskStatus.RETRYING
-            
-            # Apply exponential backoff
-            delay = task.retry_delay * (2 ** (task.retries - 1))
-            await asyncio.sleep(delay)
-            
-            # Re-queue the task
-            await self._queues[task.priority].put(task)
-            
-            self.logger.warning(
-                f"Task {task.id} failed (attempt {task.retries}/{task.max_retries}), "
-                f"retrying in {delay}s: {error}"
-            )
-        else:
-            # Task failed permanently
-            task.status = TaskStatus.FAILED
-            task.completed_at = datetime.now()
-            
-            execution_time = time.time() - task.started_at.timestamp()
-            task_result = TaskResult(
-                task_id=task.id,
-                success=False,
-                error=error,
-                execution_time=execution_time,
-                metadata={"worker_id": worker_id, "retries": task.retries}
-            )
-            self._task_results[task.id] = task_result
-            
-            self._stats["tasks_failed"] += 1
-            
-            self.logger.error(f"Task {task.id} failed permanently: {error}")
-    
-    async def _process_dependent_tasks(self, completed_task_id: str):
-        """Process tasks that were waiting for the completed task."""
-        dependent_tasks = self._dependent_tasks.get(completed_task_id, [])
-        
-        for dep_task_id in dependent_tasks:
-            if dep_task_id in self._tasks:
-                dep_task = self._tasks[dep_task_id]
-                if dep_task.status == TaskStatus.PENDING and self._are_dependencies_satisfied(dep_task):
-                    # Dependencies satisfied, queue the task for execution
-                    await self._queues[dep_task.priority].put(dep_task)
-    
-    async def submit_task(
-        self,
-        task_type: str,
-        data: Dict[str, Any],
-        callback: Optional[Callable] = None,
-        priority: TaskPriority = TaskPriority.NORMAL,
-        max_retries: int = 3,
-        retry_delay: float = 1.0,
-        timeout: Optional[float] = None,
-        dependencies: List[str] = None,
-        tags: List[str] = None,
-        metadata: Dict[str, Any] = None
-    ) -> str:
-        """
-        Submit a task to the queue.
-        
-        Args:
-            task_type: Type identifier for the task
-            data: Task input data
-            callback: Function to execute for the task
-            priority: Task priority level
-            max_retries: Maximum number of retry attempts
-            retry_delay: Base delay between retries (with exponential backoff)
-            timeout: Maximum execution time in seconds
-            dependencies: List of task IDs this task depends on
-            tags: Tags for task categorization
-            metadata: Additional metadata
-            
-        Returns:
-            str: Unique task ID
-        """
-        task_id = str(uuid.uuid4())
-        
-        task = Task(
-            id=task_id,
-            task_type=task_type,
-            data=data,
-            callback=callback,
-            priority=priority,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-            timeout=timeout,
-            dependencies=dependencies or [],
-            tags=tags or [],
-            metadata=metadata or {}
-        )
-        
-        # Register task
-        self._tasks[task_id] = task
-        
-        # Set up dependency tracking
-        if task.dependencies:
-            for dep_id in task.dependencies:
-                self._dependent_tasks[dep_id].append(task_id)
-                self._task_dependencies[task_id].append(dep_id)
-        
-        # Queue task if dependencies are satisfied, otherwise it will be queued later
-        if self._are_dependencies_satisfied(task):
-            await self._queues[priority].put(task)
-        
-        self._stats["tasks_submitted"] += 1
-        
-        self.logger.debug(f"Submitted task {task_id} with priority {priority.name}")
-        return task_id
-    
-    async def get_task_result(self, task_id: str, timeout: Optional[float] = None) -> TaskResult:
-        """
-        Wait for a task to complete and return its result.
-        
-        Args:
-            task_id: ID of the task to wait for
-            timeout: Maximum time to wait in seconds
-            
-        Returns:
-            TaskResult: The task execution result
-            
-        Raises:
-            asyncio.TimeoutError: If timeout is exceeded
-            KeyError: If task ID is not found
-        """
-        if task_id not in self._tasks:
-            raise KeyError(f"Task {task_id} not found")
-        
-        start_time = time.time()
-        
-        while task_id not in self._task_results:
-            if timeout and (time.time() - start_time) > timeout:
-                raise asyncio.TimeoutError(f"Timeout waiting for task {task_id}")
-            
-            await asyncio.sleep(0.1)  # Small delay to avoid busy waiting
-        
-        return self._task_results[task_id]
-    
-    def get_task_status(self, task_id: str) -> Optional[TaskStatus]:
-        """Get the current status of a task."""
-        if task_id in self._tasks:
-            return self._tasks[task_id].status
-        return None
-    
-    def get_task(self, task_id: str) -> Optional[Task]:
-        """Get task details by ID."""
-        return self._tasks.get(task_id)
-    
-    async def cancel_task(self, task_id: str) -> bool:
-        """
-        Cancel a task if it hasn't started executing yet.
-        
-        Args:
-            task_id: ID of the task to cancel
-            
-        Returns:
-            bool: True if task was cancelled, False otherwise
-        """
-        if task_id not in self._tasks:
-            return False
-        
-        task = self._tasks[task_id]
-        
-        if task.status in [TaskStatus.PENDING, TaskStatus.RETRYING]:
-            task.status = TaskStatus.CANCELLED
-            self._stats["tasks_cancelled"] += 1
-            
-            # Create cancelled result
-            self._task_results[task_id] = TaskResult(
-                task_id=task_id,
-                success=False,
-                error="Task was cancelled",
-                metadata={"cancelled_at": datetime.now().isoformat()}
-            )
-            
-            return True
-        
-        return False
-    
-    def get_queue_stats(self) -> Dict[str, Any]:
-        """Get current queue statistics."""
-        return {
-            "queue_sizes": {
-                priority.name: queue.qsize()
-                for priority, queue in self._queues.items()
-            },
-            "total_tasks": len(self._tasks),
-            "active_workers": len([w for w in self._workers if not w.done()]),
-            "statistics": self._stats.copy()
-        }
-    
-    def get_tasks_by_status(self, status: TaskStatus) -> List[Task]:
-        """Get all tasks with a specific status."""
-        return [task for task in self._tasks.values() if task.status == status]
-    
-    def get_tasks_by_tag(self, tag: str) -> List[Task]:
-        """Get all tasks with a specific tag."""
-        return [task for task in self._tasks.values() if tag in task.tags]
-    
-    async def wait_for_completion(self, timeout: Optional[float] = None):
-        """Wait for all queued tasks to complete."""
-        start_time = time.time()
-        
-        while True:
-            # Check if all queues are empty and no tasks are running
-            all_empty = all(queue.empty() for queue in self._queues.values())
-            no_running = not any(
-                task.status == TaskStatus.RUNNING 
-                for task in self._tasks.values()
-            )
-            
-            if all_empty and no_running:
-                break
-            
-            if timeout and (time.time() - start_time) > timeout:
-                raise asyncio.TimeoutError("Timeout waiting for task completion")
-            
+        elif task.type == "planner_agent":
+            # Simulate planning
             await asyncio.sleep(0.5)
+            return {"plan": {"steps": ["step1", "step2"]}}
+            
+        elif task.type == "context_agent":
+            # Simulate context analysis
+            await asyncio.sleep(0.3)
+            return {"context": {"user_intent": "query"}}
+            
+        elif task.type == "memory_agent":
+            # Simulate memory storage
+            await asyncio.sleep(0.2)
+            return {"memory_id": str(uuid.uuid4())}
+            
+        elif task.type == "insight_agent":
+            # Simulate insight generation
+            await asyncio.sleep(0.8)
+            return {"insights": ["insight1", "insight2"]}
+            
+        elif task.type == "response_agent":
+            # Simulate response generation
+            await asyncio.sleep(0.5)
+            return {"response": "This is a simulated response"}
+            
+        else:
+            raise ValueError(f"Unknown task type: {task.type}")
+            
+    async def get_queue_stats(self) -> Dict[str, Any]:
+        """Get queue statistics"""
+        return {
+            "queue_size": await self.queue.size(),
+            "running_tasks": len(self.running_tasks),
+            "completed_tasks": len(self.completed_tasks),
+            "max_concurrent_tasks": self.max_concurrent_tasks,
+            "is_running": self.is_running,
+            "num_workers": len(self.workers)
+        }
+
+
+# Test function
+async def test_task_queue():
+    """Test the task queue independently"""
+    queue = TaskQueue(max_concurrent_tasks=3)
     
-    async def shutdown(self, timeout: float = 30.0):
-        """Shutdown the task queue and cleanup resources."""
-        self.logger.info("Shutting down task queue...")
+    # Start the queue
+    await queue.start(num_workers=2)
+    
+    # Create test tasks
+    tasks = []
+    for i in range(5):
+        task = Task(
+            type=["voice_agent", "planner_agent", "insight_agent"][i % 3],
+            data={"test_data": f"test_{i}"},
+            priority=(i % 3) + 1
+        )
+        task_id = await queue.enqueue(task)
+        tasks.append(task_id)
         
-        # Signal shutdown
-        self._shutdown_event.set()
+    # Wait a bit for processing
+    await asyncio.sleep(3)
+    
+    # Check task statuses
+    for task_id in tasks:
+        status = await queue.get_task_status(task_id)
+        print(f"Task {task_id}: {status}")
         
-        # Cancel all pending tasks
-        for task in self._tasks.values():
-            if task.status in [TaskStatus.PENDING, TaskStatus.RETRYING]:
-                await self.cancel_task(task.id)
-        
-        # Cancel all workers
-        for worker in self._workers:
-            worker.cancel()
-        
-        # Wait for workers to finish
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*self._workers, return_exceptions=True),
-                timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            self.logger.warning("Some workers did not shutdown gracefully")
-        
-        self.logger.info("Task queue shutdown complete")
+    # Get queue stats
+    stats = await queue.get_queue_stats()
+    print(f"Queue stats: {stats}")
+    
+    # Stop the queue
+    await queue.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(test_task_queue())

@@ -1,365 +1,476 @@
-"""
-Main orchestrator for coordinating multiple agents using LangGraph and LangChain.
-Manages the flow of tasks between different specialized agents.
-"""
-
-from typing import Dict, Any, List, Optional, TypedDict
-from langchain_google_genai import ChatGoogleGenerativeAI
+from typing import Dict, List, Any, Optional, TypedDict, Annotated, Sequence
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolExecutor
-from langchain.schema import BaseMessage
-import logging
+from langchain.schema import BaseMessage, HumanMessage, AIMessage
+from dataclasses import dataclass
 from enum import Enum
+import logging
+import json
+import uuid
+from datetime import datetime
 
-from .event_bus import EventBus
-from .task_queue import TaskQueue
-from .agent_pool import AgentPool
-from ..agents.base_agent import BaseAgent
-from ..models.agent_models import AgentState, TaskRequest, TaskResponse
-
-
-class AgentType(Enum):
-    PLANNER = "planner"
-    VOICE = "voice"
-    VISION = "vision"
-    CONTEXT = "context"
-    MEMORY = "memory"
-    INSIGHT = "insight"
-    RESPONSE = "response"
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-class OrchestratorState(TypedDict):
-    """State shared across all agents in the orchestration graph."""
-    user_input: str
-    intent: Optional[str]
-    extracted_entities: Dict[str, Any]
-    context_data: Dict[str, Any]
+class AgentState(TypedDict):
+    """State passed between nodes in the graph"""
+    messages: Sequence[BaseMessage]
+    current_agent: str
+    task_data: Dict[str, Any]
+    workflow_id: str
+    user_id: str
+    context: Dict[str, Any]
+    plan: Dict[str, Any]
     memories: List[Dict[str, Any]]
     insights: List[Dict[str, Any]]
-    response: Optional[str]
-    current_agent: Optional[str]
-    task_history: List[Dict[str, Any]]
+    response: str
     error: Optional[str]
-    metadata: Dict[str, Any]
+    retry_count: int
 
 
-class LifeWitnessOrchestrator:
-    """
-    Main orchestrator that coordinates multiple specialized agents using LangGraph.
-    """
+class EventType(Enum):
+    """Enumeration of all possible event types in the system"""
+    TRANSCRIPTION_COMPLETE = "transcription_complete"
+    PLAN_CREATED = "plan_created"
+    CONTEXT_ANALYZED = "context_analyzed"
+    MEMORY_STORED = "memory_stored"
+    INSIGHT_GENERATED = "insight_generated"
+    RESPONSE_READY = "response_ready"
+    VISION_ANALYZED = "vision_analyzed"
+
+
+class Orchestrator:
+    """Main orchestrator that coordinates all agents using LangGraph"""
     
-    def __init__(self, gemini_api_key: str, config: Dict[str, Any]):
-        self.gemini_api_key = gemini_api_key
-        self.config = config
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, agent_pool=None, event_bus=None, task_queue=None):
+        self.agent_pool = agent_pool
+        self.event_bus = event_bus
+        self.task_queue = task_queue
+        self.graph = self._build_graph()
+        self.compiled_graph = self.graph.compile()
         
-        # Initialize core components
-        self.event_bus = EventBus()
-        self.task_queue = TaskQueue()
-        self.agent_pool = AgentPool(gemini_api_key, config)
+    def _build_graph(self) -> StateGraph:
+        """Build the LangGraph workflow"""
+        # Define the graph
+        workflow = StateGraph(AgentState)
         
-        # Initialize LangChain Gemini model
-        self.llm = ChatGoogleGenerativeAI(
-            model="gemini-pro",
-            google_api_key=gemini_api_key,
-            temperature=0.3,
-            convert_system_message_to_human=True
-        )
+        # Add nodes for each agent
+        workflow.add_node("voice_agent", self._voice_agent_node)
+        workflow.add_node("planner_agent", self._planner_agent_node)
+        workflow.add_node("context_agent", self._context_agent_node)
+        workflow.add_node("memory_agent", self._memory_agent_node)
+        workflow.add_node("insight_agent", self._insight_agent_node)
+        workflow.add_node("response_agent", self._response_agent_node)
+        workflow.add_node("error_handler", self._error_handler_node)
         
-        # Build the orchestration graph
-        self.graph = self._build_orchestration_graph()
+        # Set the entry point
+        workflow.set_entry_point("voice_agent")
         
-    def _build_orchestration_graph(self) -> StateGraph:
-        """Build the LangGraph state graph for agent orchestration."""
-        workflow = StateGraph(OrchestratorState)
+        # Add edges
+        workflow.add_edge("voice_agent", "planner_agent")
+        workflow.add_edge("planner_agent", "context_agent")
+        workflow.add_edge("context_agent", "memory_agent")
+        workflow.add_edge("memory_agent", "insight_agent")
+        workflow.add_edge("insight_agent", "response_agent")
+        workflow.add_edge("response_agent", END)
         
-        # Add nodes for each agent type
-        workflow.add_node("planner", self._run_planner_agent)
-        workflow.add_node("voice_processor", self._run_voice_agent)
-        workflow.add_node("vision_processor", self._run_vision_agent)
-        workflow.add_node("context_gatherer", self._run_context_agent)
-        workflow.add_node("memory_manager", self._run_memory_agent)
-        workflow.add_node("insight_analyzer", self._run_insight_agent)
-        workflow.add_node("response_generator", self._run_response_agent)
-        workflow.add_node("error_handler", self._handle_error)
-        
-        # Define the workflow edges
-        workflow.set_entry_point("planner")
-        
-        # Conditional routing based on planner output
+        # Add conditional edges for error handling
         workflow.add_conditional_edges(
-            "planner",
-            self._route_after_planning,
+            "voice_agent",
+            self._check_error,
             {
-                "voice": "voice_processor",
-                "vision": "vision_processor",
-                "context": "context_gatherer",
-                "memory": "memory_manager",
-                "error": "error_handler"
+                "error": "error_handler",
+                "continue": "planner_agent"
             }
         )
         
-        # Sequential processing for multi-modal inputs
-        workflow.add_edge("voice_processor", "context_gatherer")
-        workflow.add_edge("vision_processor", "context_gatherer")
-        workflow.add_edge("context_gatherer", "memory_manager")
-        workflow.add_edge("memory_manager", "insight_analyzer")
-        workflow.add_edge("insight_analyzer", "response_generator")
-        workflow.add_edge("response_generator", END)
-        workflow.add_edge("error_handler", END)
+        workflow.add_conditional_edges(
+            "planner_agent",
+            self._check_error,
+            {
+                "error": "error_handler",
+                "continue": "context_agent"
+            }
+        )
         
-        return workflow.compile()
+        return workflow
     
-    def _route_after_planning(self, state: OrchestratorState) -> str:
-        """Route to appropriate agent based on planner output."""
-        try:
-            intent = state.get("intent", "")
-            
-            if state.get("error"):
-                return "error"
-            elif "voice" in intent.lower():
-                return "voice"
-            elif "image" in intent.lower() or "photo" in intent.lower():
-                return "vision"
-            elif "search" in intent.lower() or "remember" in intent.lower():
-                return "memory"
-            else:
-                return "context"
-                
-        except Exception as e:
-            self.logger.error(f"Routing error: {e}")
+    def _check_error(self, state: AgentState) -> str:
+        """Check if there's an error in the state"""
+        if state.get("error"):
             return "error"
+        return "continue"
     
-    async def _run_planner_agent(self, state: OrchestratorState) -> OrchestratorState:
-        """Execute the planner agent to analyze intent and plan tasks."""
+    async def _voice_agent_node(self, state: AgentState) -> AgentState:
+        """Process voice input"""
         try:
-            agent = await self.agent_pool.get_agent(AgentType.PLANNER)
+            logger.info("Processing voice input...")
             
-            task_request = TaskRequest(
-                task_type="plan",
-                input_data={"user_input": state["user_input"]},
-                context=state.get("metadata", {})
-            )
+            # Get agent from pool if available
+            agent = None
+            if self.agent_pool:
+                agent = await self.agent_pool.acquire("voice_agent")
             
-            response = await agent.process_task(task_request)
+            # Process the voice data
+            audio_data = state["task_data"].get("audio_data", "")
             
-            state["intent"] = response.result.get("intent")
-            state["extracted_entities"] = response.result.get("entities", {})
-            state["current_agent"] = "planner"
+            # Simulate processing (in real implementation, use actual voice agent)
+            transcription = f"Transcribed: {state['task_data'].get('text', 'Hello, this is a test')}"
             
-            # Emit planning event
-            await self.event_bus.emit("agent.planning.completed", {
-                "intent": state["intent"],
-                "entities": state["extracted_entities"]
-            })
+            # Update state
+            state["messages"].append(HumanMessage(content=transcription))
+            state["task_data"]["transcription"] = transcription
+            state["current_agent"] = "voice_agent"
             
-            return state
+            # Publish event if event bus is available
+            if self.event_bus:
+                await self.event_bus.publish({
+                    "type": EventType.TRANSCRIPTION_COMPLETE,
+                    "data": {
+                        "transcription": transcription,
+                        "user_id": state["user_id"]
+                    }
+                })
+            
+            # Release agent back to pool
+            if self.agent_pool and agent:
+                await self.agent_pool.release("voice_agent", agent)
+            
+            logger.info(f"Voice transcription complete: {transcription[:50]}...")
             
         except Exception as e:
-            self.logger.error(f"Planner agent error: {e}")
+            logger.error(f"Error in voice agent: {str(e)}")
             state["error"] = str(e)
-            return state
-    
-    async def _run_voice_agent(self, state: OrchestratorState) -> OrchestratorState:
-        """Execute voice processing agent."""
-        try:
-            agent = await self.agent_pool.get_agent(AgentType.VOICE)
+            state["retry_count"] = state.get("retry_count", 0) + 1
             
-            task_request = TaskRequest(
-                task_type="voice_process",
-                input_data={"audio_data": state.get("user_input")},
-                context=state.get("context_data", {})
-            )
-            
-            response = await agent.process_task(task_request)
-            state["context_data"]["voice_analysis"] = response.result
-            state["current_agent"] = "voice"
-            
-            return state
-            
-        except Exception as e:
-            self.logger.error(f"Voice agent error: {e}")
-            state["error"] = str(e)
-            return state
-    
-    async def _run_vision_agent(self, state: OrchestratorState) -> OrchestratorState:
-        """Execute vision processing agent."""
-        try:
-            agent = await self.agent_pool.get_agent(AgentType.VISION)
-            
-            task_request = TaskRequest(
-                task_type="vision_analyze",
-                input_data={"image_data": state.get("user_input")},
-                context=state.get("context_data", {})
-            )
-            
-            response = await agent.process_task(task_request)
-            state["context_data"]["vision_analysis"] = response.result
-            state["current_agent"] = "vision"
-            
-            return state
-            
-        except Exception as e:
-            self.logger.error(f"Vision agent error: {e}")
-            state["error"] = str(e)
-            return state
-    
-    async def _run_context_agent(self, state: OrchestratorState) -> OrchestratorState:
-        """Execute context gathering agent."""
-        try:
-            agent = await self.agent_pool.get_agent(AgentType.CONTEXT)
-            
-            task_request = TaskRequest(
-                task_type="gather_context",
-                input_data={
-                    "entities": state["extracted_entities"],
-                    "intent": state["intent"]
-                },
-                context=state.get("context_data", {})
-            )
-            
-            response = await agent.process_task(task_request)
-            state["context_data"].update(response.result)
-            state["current_agent"] = "context"
-            
-            return state
-            
-        except Exception as e:
-            self.logger.error(f"Context agent error: {e}")
-            state["error"] = str(e)
-            return state
-    
-    async def _run_memory_agent(self, state: OrchestratorState) -> OrchestratorState:
-        """Execute memory management agent."""
-        try:
-            agent = await self.agent_pool.get_agent(AgentType.MEMORY)
-            
-            task_request = TaskRequest(
-                task_type="memory_operation",
-                input_data={
-                    "query": state["user_input"],
-                    "entities": state["extracted_entities"],
-                    "context": state["context_data"]
-                }
-            )
-            
-            response = await agent.process_task(task_request)
-            state["memories"] = response.result.get("memories", [])
-            state["current_agent"] = "memory"
-            
-            return state
-            
-        except Exception as e:
-            self.logger.error(f"Memory agent error: {e}")
-            state["error"] = str(e)
-            return state
-    
-    async def _run_insight_agent(self, state: OrchestratorState) -> OrchestratorState:
-        """Execute insight analysis agent."""
-        try:
-            agent = await self.agent_pool.get_agent(AgentType.INSIGHT)
-            
-            task_request = TaskRequest(
-                task_type="analyze_patterns",
-                input_data={
-                    "memories": state["memories"],
-                    "context": state["context_data"]
-                }
-            )
-            
-            response = await agent.process_task(task_request)
-            state["insights"] = response.result.get("insights", [])
-            state["current_agent"] = "insight"
-            
-            return state
-            
-        except Exception as e:
-            self.logger.error(f"Insight agent error: {e}")
-            state["error"] = str(e)
-            return state
-    
-    async def _run_response_agent(self, state: OrchestratorState) -> OrchestratorState:
-        """Execute response generation agent."""
-        try:
-            agent = await self.agent_pool.get_agent(AgentType.RESPONSE)
-            
-            task_request = TaskRequest(
-                task_type="generate_response",
-                input_data={
-                    "user_input": state["user_input"],
-                    "memories": state["memories"],
-                    "insights": state["insights"],
-                    "context": state["context_data"]
-                }
-            )
-            
-            response = await agent.process_task(task_request)
-            state["response"] = response.result.get("response")
-            state["current_agent"] = "response"
-            
-            return state
-            
-        except Exception as e:
-            self.logger.error(f"Response agent error: {e}")
-            state["error"] = str(e)
-            return state
-    
-    async def _handle_error(self, state: OrchestratorState) -> OrchestratorState:
-        """Handle errors in the orchestration flow."""
-        error_msg = state.get("error", "Unknown error occurred")
-        self.logger.error(f"Orchestration error: {error_msg}")
-        
-        state["response"] = f"I apologize, but I encountered an error: {error_msg}"
         return state
     
-    async def process_user_request(self, user_input: str, metadata: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        Main entry point for processing user requests through the orchestration graph.
-        """
-        initial_state = OrchestratorState(
-            user_input=user_input,
-            intent=None,
-            extracted_entities={},
-            context_data={},
-            memories=[],
-            insights=[],
-            response=None,
-            current_agent=None,
-            task_history=[],
-            error=None,
-            metadata=metadata or {}
-        )
+    async def _planner_agent_node(self, state: AgentState) -> AgentState:
+        """Create a plan based on the transcription"""
+        try:
+            logger.info("Creating plan...")
+            
+            # Get agent from pool
+            agent = None
+            if self.agent_pool:
+                agent = await self.agent_pool.acquire("planner_agent")
+            
+            transcription = state["task_data"].get("transcription", "")
+            
+            # Simulate planning (in real implementation, use actual planner agent)
+            plan = {
+                "steps": [
+                    "Analyze user intent",
+                    "Gather relevant context",
+                    "Generate insights",
+                    "Formulate response"
+                ],
+                "intent": "user_query",
+                "priority": "high"
+            }
+            
+            # Update state
+            state["plan"] = plan
+            state["current_agent"] = "planner_agent"
+            state["messages"].append(AIMessage(content=f"Plan created: {json.dumps(plan)}"))
+            
+            # Publish event
+            if self.event_bus:
+                await self.event_bus.publish({
+                    "type": EventType.PLAN_CREATED,
+                    "data": {
+                        "plan": plan,
+                        "user_id": state["user_id"]
+                    }
+                })
+            
+            # Release agent
+            if self.agent_pool and agent:
+                await self.agent_pool.release("planner_agent", agent)
+            
+            logger.info("Plan created successfully")
+            
+        except Exception as e:
+            logger.error(f"Error in planner agent: {str(e)}")
+            state["error"] = str(e)
+            
+        return state
+    
+    async def _context_agent_node(self, state: AgentState) -> AgentState:
+        """Analyze context based on the plan"""
+        try:
+            logger.info("Analyzing context...")
+            
+            # Get agent from pool
+            agent = None
+            if self.agent_pool:
+                agent = await self.agent_pool.acquire("context_agent")
+            
+            plan = state.get("plan", {})
+            
+            # Simulate context analysis
+            context = {
+                "user_profile": {
+                    "preferences": ["technical", "detailed"],
+                    "history": ["previous_queries"]
+                },
+                "environment": {
+                    "time": "afternoon",
+                    "location": "office"
+                },
+                "relevant_data": ["data1", "data2"]
+            }
+            
+            # Update state
+            state["context"] = context
+            state["current_agent"] = "context_agent"
+            state["messages"].append(AIMessage(content=f"Context analyzed: {json.dumps(context)}"))
+            
+            # Publish event
+            if self.event_bus:
+                await self.event_bus.publish({
+                    "type": EventType.CONTEXT_ANALYZED,
+                    "data": {
+                        "context": context,
+                        "user_id": state["user_id"]
+                    }
+                })
+            
+            # Release agent
+            if self.agent_pool and agent:
+                await self.agent_pool.release("context_agent", agent)
+            
+            logger.info("Context analysis complete")
+            
+        except Exception as e:
+            logger.error(f"Error in context agent: {str(e)}")
+            state["error"] = str(e)
+            
+        return state
+    
+    async def _memory_agent_node(self, state: AgentState) -> AgentState:
+        """Store relevant information in memory"""
+        try:
+            logger.info("Storing memory...")
+            
+            # Get agent from pool
+            agent = None
+            if self.agent_pool:
+                agent = await self.agent_pool.acquire("memory_agent")
+            
+            context = state.get("context", {})
+            
+            # Simulate memory storage
+            memory_entry = {
+                "timestamp": "2024-01-01T00:00:00",
+                "interaction": state["task_data"].get("transcription", ""),
+                "context": context,
+                "tags": ["voice", "query"]
+            }
+            
+            # Update state
+            state["memories"] = [memory_entry]
+            state["current_agent"] = "memory_agent"
+            state["messages"].append(AIMessage(content="Memory stored successfully"))
+            
+            # Publish event
+            if self.event_bus:
+                await self.event_bus.publish({
+                    "type": EventType.MEMORY_STORED,
+                    "data": {
+                        "memory": memory_entry,
+                        "user_id": state["user_id"]
+                    }
+                })
+            
+            # Release agent
+            if self.agent_pool and agent:
+                await self.agent_pool.release("memory_agent", agent)
+            
+            logger.info("Memory stored successfully")
+            
+        except Exception as e:
+            logger.error(f"Error in memory agent: {str(e)}")
+            state["error"] = str(e)
+            
+        return state
+    
+    async def _insight_agent_node(self, state: AgentState) -> AgentState:
+        """Generate insights based on context and memories"""
+        try:
+            logger.info("Generating insights...")
+            
+            # Get agent from pool
+            agent = None
+            if self.agent_pool:
+                agent = await self.agent_pool.acquire("insight_agent")
+            
+            context = state.get("context", {})
+            memories = state.get("memories", [])
+            
+            # Simulate insight generation
+            insights = [
+                {
+                    "type": "pattern",
+                    "description": "User frequently asks technical questions",
+                    "confidence": 0.85
+                },
+                {
+                    "type": "recommendation",
+                    "description": "Provide detailed technical explanations",
+                    "confidence": 0.90
+                }
+            ]
+            
+            # Update state
+            state["insights"] = insights
+            state["current_agent"] = "insight_agent"
+            state["messages"].append(AIMessage(content=f"Insights generated: {len(insights)} insights"))
+            
+            # Publish event
+            if self.event_bus:
+                await self.event_bus.publish({
+                    "type": EventType.INSIGHT_GENERATED,
+                    "data": {
+                        "insights": insights,
+                        "user_id": state["user_id"]
+                    }
+                })
+            
+            # Release agent
+            if self.agent_pool and agent:
+                await self.agent_pool.release("insight_agent", agent)
+            
+            logger.info(f"Generated {len(insights)} insights")
+            
+        except Exception as e:
+            logger.error(f"Error in insight agent: {str(e)}")
+            state["error"] = str(e)
+            
+        return state
+    
+    async def _response_agent_node(self, state: AgentState) -> AgentState:
+        """Generate final response based on all previous processing"""
+        try:
+            logger.info("Generating response...")
+            
+            # Get agent from pool
+            agent = None
+            if self.agent_pool:
+                agent = await self.agent_pool.acquire("response_agent")
+            
+            plan = state.get("plan", {})
+            context = state.get("context", {})
+            insights = state.get("insights", [])
+            
+            # Simulate response generation
+            response = f"""Based on your query: {state['task_data'].get('transcription', '')}
+            
+I've analyzed the context and generated the following response:
+- Intent: {plan.get('intent', 'unknown')}
+- Relevant insights: {len(insights)} insights found
+- Personalized based on your preferences
+
+This is a sample response that would be generated by the actual response agent."""
+            
+            # Update state
+            state["response"] = response
+            state["current_agent"] = "response_agent"
+            state["messages"].append(AIMessage(content=response))
+            
+            # Publish event
+            if self.event_bus:
+                await self.event_bus.publish({
+                    "type": EventType.RESPONSE_READY,
+                    "data": {
+                        "response": response,
+                        "user_id": state["user_id"]
+                    }
+                })
+            
+            # Release agent
+            if self.agent_pool and agent:
+                await self.agent_pool.release("response_agent", agent)
+            
+            logger.info("Response generated successfully")
+            
+        except Exception as e:
+            logger.error(f"Error in response agent: {str(e)}")
+            state["error"] = str(e)
+            
+        return state
+    
+    async def _error_handler_node(self, state: AgentState) -> AgentState:
+        """Handle errors in the workflow"""
+        error = state.get("error", "Unknown error")
+        retry_count = state.get("retry_count", 0)
+        
+        logger.error(f"Error in workflow: {error}, retry count: {retry_count}")
+        
+        if retry_count < 3:
+            # Clear error and retry
+            state["error"] = None
+            logger.info(f"Retrying workflow, attempt {retry_count + 1}")
+        else:
+            # Max retries reached, set final error response
+            state["response"] = f"I apologize, but I encountered an error processing your request: {error}"
+            
+        return state
+    
+    async def process_request(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Process a request through the orchestration workflow"""
+        initial_state = {
+            "messages": [],
+            "current_agent": "orchestrator",
+            "task_data": request_data,
+            "workflow_id": request_data.get("workflow_id", "default"),
+            "user_id": request_data.get("user_id", "default_user"),
+            "context": {},
+            "plan": {},
+            "memories": [],
+            "insights": [],
+            "response": "",
+            "error": None,
+            "retry_count": 0
+        }
         
         try:
-            # Execute the orchestration graph
-            final_state = await self.graph.ainvoke(initial_state)
-            
-            # Emit completion event
-            await self.event_bus.emit("orchestration.completed", {
-                "response": final_state.get("response"),
-                "agents_used": final_state.get("task_history", [])
-            })
+            # Run the graph
+            final_state = await self.compiled_graph.ainvoke(initial_state)
             
             return {
-                "response": final_state.get("response"),
-                "memories": final_state.get("memories", []),
-                "insights": final_state.get("insights", []),
-                "context": final_state.get("context_data", {}),
-                "success": final_state.get("error") is None
+                "success": True,
+                "response": final_state.get("response", ""),
+                "workflow_id": final_state.get("workflow_id"),
+                "insights": final_state.get("insights", [])
             }
             
         except Exception as e:
-            self.logger.error(f"Orchestration failed: {e}")
+            logger.error(f"Error in orchestration: {str(e)}")
             return {
-                "response": f"I'm sorry, but I encountered an error processing your request: {str(e)}",
-                "memories": [],
-                "insights": [],
-                "context": {},
-                "success": False
+                "success": False,
+                "error": str(e),
+                "workflow_id": initial_state.get("workflow_id")
             }
+
+
+# Test function
+async def test_orchestrator():
+    """Test the orchestrator independently"""
+    orchestrator = Orchestrator()
     
-    async def shutdown(self):
-        """Cleanup resources."""
-        await self.agent_pool.shutdown()
-        await self.task_queue.shutdown()
-        await self.event_bus.shutdown()
+    test_request = {
+        "audio_data": "test_audio_base64",
+        "text": "What's the weather like today?",
+        "user_id": "test_user",
+        "workflow_id": "test_workflow"
+    }
+    
+    result = await orchestrator.process_request(test_request)
+    print(f"Test result: {json.dumps(result, indent=2)}")
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(test_orchestrator())
