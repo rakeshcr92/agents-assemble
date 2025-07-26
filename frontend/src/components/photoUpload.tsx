@@ -131,14 +131,14 @@ const PhotoUploadModal: React.FC<PhotoUploadModalProps> = ({
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="bg-gray-900 border border-gray-700 rounded-xl mx-auto w-[30%]"
+        className="bg-white border border-gray-700 rounded-xl mx-auto w-[30%]"
       >
         {/* Header */}
-        <div className="flex justify-between items-center p-6 border-b border-gray-700">
-          <h2 className="text-xl font-bold text-gray-100">Upload Photo</h2>
+        <div className="flex justify-between items-center p-6 border-b border-gray-200">
+          <h2 className="text-xl font-bold text-gray-800">Upload Photo</h2>
           <button
             onClick={handleClose}
-            className="text-gray-400 hover:text-gray-200 text-2xl leading-none"
+            className="text-gray-400 hover:text-gray-700 text-2xl leading-none"
           >
             ×
           </button>
@@ -150,8 +150,8 @@ const PhotoUploadModal: React.FC<PhotoUploadModalProps> = ({
           <div
             className={`relative border-2 border-dashed rounded-lg p-8 text-center transition-all duration-200 ${
               dragActive
-                ? "border-blue-400 bg-blue-400 bg-opacity-10"
-                : "border-gray-600 hover:border-gray-500"
+                ? "border-blue-400 bg-blue-100 bg-opacity-10"
+                : "border-gray-300 hover:border-gray-400"
             }`}
             onDragEnter={handleDrag}
             onDragLeave={handleDrag}
@@ -163,9 +163,9 @@ const PhotoUploadModal: React.FC<PhotoUploadModalProps> = ({
                 <img
                   src={uploadedPhoto.preview}
                   alt="Preview"
-                  className="w-32 h-32 object-cover rounded-lg mx-auto border border-gray-600"
+                  className="w-32 h-32 object-cover rounded-lg mx-auto border border-gray-300"
                 />
-                <p className="text-sm text-gray-300">
+                <p className="text-sm text-gray-600">
                   {uploadedPhoto.file.name}
                 </p>
                 <button
@@ -180,14 +180,14 @@ const PhotoUploadModal: React.FC<PhotoUploadModalProps> = ({
               <div className="space-y-4">
                 <div className="text-4xl">📸</div>
                 <div>
-                  <p className="text-gray-300 mb-2">
+                  <p className="text-gray-600 mb-2">
                     Drag and drop your photo here
                   </p>
                   <p className="text-gray-500 text-sm mb-4">or</p>
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    className="bg-gray-800 hover:bg-gray-700 text-gray-100 px-4 py-2 rounded-lg border border-gray-600 transition-colors"
+                    className="bg-white hover:bg-gray-100 text-gray-800 px-4 py-2 rounded-lg border border-gray-300 transition-colors"
                   >
                     Browse Files
                   </button>
@@ -207,7 +207,7 @@ const PhotoUploadModal: React.FC<PhotoUploadModalProps> = ({
           {/* Photo Name Input */}
           {uploadedPhoto && (
             <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
                 Photo Name
               </label>
               <input
@@ -215,7 +215,7 @@ const PhotoUploadModal: React.FC<PhotoUploadModalProps> = ({
                 value={photoName}
                 onChange={(e) => setPhotoName(e.target.value)}
                 placeholder="Enter a name for this photo..."
-                className="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-gray-100 placeholder-gray-500 focus:border-blue-400 focus:outline-none"
+                className="w-full bg-white border border-gray-300 rounded-lg px-3 py-2 text-gray-800 placeholder-gray-400 focus:border-blue-400 focus:outline-none"
                 required
               />
             </div>
@@ -226,7 +226,7 @@ const PhotoUploadModal: React.FC<PhotoUploadModalProps> = ({
             <button
               type="button"
               onClick={handleClose}
-              className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 py-2 px-4 rounded-lg border border-gray-600 transition-colors"
+              className="flex-1 bg-white hover:bg-gray-100 text-gray-700 py-2 px-4 rounded-lg border border-gray-300 transition-colors"
             >
               Cancel
             </button>
@@ -234,7 +234,7 @@ const PhotoUploadModal: React.FC<PhotoUploadModalProps> = ({
               type="button"
               onClick={handleSubmit}
               disabled={!uploadedPhoto || !photoName.trim() || isUploading}
-              className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white py-2 px-4 rounded-lg transition-colors flex items-center justify-center gap-2"
+              className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 disabled:text-gray-500 text-white py-2 px-4 rounded-lg transition-colors flex items-center justify-center gap-2"
             >
               {isUploading ? (
                 <>
