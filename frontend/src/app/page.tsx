@@ -8,6 +8,8 @@ import type { Swiper as SwiperCore } from 'swiper';
 import 'swiper/css';
 import 'swiper/css/effect-coverflow';
 import 'swiper/css/pagination';
+import { callAgentAPI } from "@/services/apiClient";
+import Image from 'next/image';
 
 export default function Home() {
   // Here, I'm setting up the state for my component. This is the information
@@ -16,7 +18,8 @@ export default function Home() {
   const [currentUserQuery, setCurrentUserQuery] = useState('');
   const [currentAgentReply, setCurrentAgentReply] = useState('');
   const [highlightedMemoryId, setHighlightedMemoryId] = useState<number | null>(null);
-  
+  const [agentReply, setAgentReply] = useState<string>("");
+
   // This ref gives me direct control over the carousel component.
   const carouselRef = useRef<SwiperCore | null>(null);
 
@@ -72,6 +75,11 @@ export default function Home() {
     setCurrentStepIndex((prevIndex) => (prevIndex + 1) % demoConversation.length);
   };
 
+  const handleAskAgent = async (query: string) => {
+    const result = await callAgentAPI(query);
+    setAgentReply(result.response || JSON.stringify(result));
+  };
+
   return (
     <div className="bg-gray-900 text-gray-100 min-h-screen flex flex-col font-sans p-5 sm:p-8 overflow-y-auto">
       
@@ -102,10 +110,10 @@ export default function Home() {
           {memoryPhotos.map(photo => (
             <SwiperSlide key={photo.id}>
               <div className="flex flex-col items-center justify-center h-full pt-10">
-                <img 
+                <Image 
                   src={photo.imageUrl} 
                   alt={photo.name || ''}
-                  // This changes the image style if it's the one we're highlighting.
+                  width={160} height={160}
                   className={`w-32 h-32 sm:w-40 sm:h-40 object-cover rounded-xl border-2 transition-all duration-300 ${
                     highlightedMemoryId === photo.id 
                     ? 'border-blue-400 scale-110'
@@ -126,7 +134,7 @@ export default function Home() {
             >
               🎤
             </button>
-            <p className="text-gray-400 italic text-lg">"{currentUserQuery || 'Click the mic to start the conversation...'}"</p>
+            <p className="text-gray-400 italic text-lg">&quot;{currentUserQuery || 'Click the mic to start the conversation...'}&quot;</p>
           </div>
           <button className="bg-gray-800 hover:bg-gray-700 transition-colors border border-gray-600 rounded-full w-16 h-16 text-4xl flex items-center justify-center flex-shrink-0">
             🖼️
@@ -139,6 +147,10 @@ export default function Home() {
                 <p className="mt-2 whitespace-pre-line">{currentAgentReply}</p>
             </div>
         )}
+        <div>
+          <button onClick={() => handleAskAgent("calculate 2 + 2")}>Ask Agent</button>
+          {agentReply && <div>{agentReply}</div>}
+        </div>
       </main>
     </div>
   );
