@@ -2,9 +2,37 @@ fastapi
 pydantic
 uvicorn[standard]
 google-cloud-firestore==2.13.1
-google-cloud-storage==2.12.0
+google-cloud-storage>=2.14.0,<3.0.0
 google-cloud-tasks
 google-cloud-secret-manager
 google-api-python-client
 google-auth
 # Add other Google Cloud packages as needed
+
+langchain
+langchain-google-genai
+langgraph
+python-dotenv
+dataclasses-json
+fastapi
+pydantic
+# Standard library modules (no need to install): asyncio, logging, typing, datetime, enum, uuid, json, time, weakref, collections, importlib
+
+# Core dependencies for LangChain and Google Vertex AI LLM integration
+langchain==0.0.202
+langchain-google-vertexai==0.0.5
+
+# Google Cloud AI SDKs
+google-cloud-aiplatform
+google-cloud-speech==2.15.1
+google-cloud-texttospeech==2.15.1
+
+# Audio processing
+pydub==0.25.1
+
+# Optional but recommended for environment management
+python-dotenv==1.0.0
+
+# For testing if needed
+pytest==7.4.0
+pytest-asyncio==0.21.0
