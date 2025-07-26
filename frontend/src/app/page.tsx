@@ -9,13 +9,10 @@ import "swiper/css";
 import "swiper/css/effect-coverflow";
 import "swiper/css/pagination";
 
-// SHIVANI ADDITION: Importing the photoUpload component
 import PhotoUploadModal from "../components/photoUpload";
-// Import the voice components and services
 import VoiceInterface from "../components/voiceInterface";
 import { voiceService, type VoiceQueryResult } from "../services/voiceService";
 
-// Helper component for the word-by-word typing effect
 const TypewriterText = ({
   text,
   onComplete,
@@ -61,25 +58,23 @@ export default function Home() {
   const [activeIndex, setActiveIndex] = useState(0);
   const chatContainerRef = useRef<HTMLDivElement | null>(null);
 
-  // SHIVANI ADDITION: State to manage the photo upload modal
   const [isPhotoModalOpen, setIsPhotoModalOpen] = useState(false);
+  const [showPhotoUploadLeft, setShowPhotoUploadLeft] = useState(false);
 
-  // Voice interface state - UPDATED FOR CONTROLLED MODE
   const [currentUserQuery, setCurrentUserQuery] = useState("");
   const [isVoiceListening, setIsVoiceListening] = useState(false);
   const [isProcessingVoice, setIsProcessingVoice] = useState(false);
   const [voiceTranscript, setVoiceTranscript] = useState("");
 
-  // NEW: Store the actual user queries and control demo vs real mode
   const [actualUserQueries, setActualUserQueries] = useState<string[]>([]);
   const [isUsingRealQueries, setIsUsingRealQueries] = useState(false);
 
   const memoryPhotos = [
-    { id: 1, name: "Jennifer Chen", imageUrl: "/placeholder.png" },
-    { id: 2, name: "Jake's Bday", imageUrl: "/placeholder.png" },
-    { id: 3, name: "Coffee Meetup", imageUrl: "/placeholder.png" },
-    { id: 4, name: "Team Lunch", imageUrl: "/placeholder.png" },
-    { id: 5, name: "Project Demo", imageUrl: "/placeholder.png" },
+    { id: 1, name: "Jennifer Chen", imageUrl: "/Jennifer.jpeg" },
+    { id: 2, name: "Jake's Bday", imageUrl: "/Jakes Birthday.jpeg" },
+    { id: 3, name: "Coffee Meetup", imageUrl: "/Coffee Meetup.jpeg" },
+    { id: 4, name: "Team Lunch", imageUrl: "/Team Lunch.jpeg" },
+    { id: 5, name: "Day at Park", imageUrl: "/Day at park.jpeg" },
   ];
 
   useEffect(() => {
@@ -94,11 +89,11 @@ export default function Home() {
 
   const wait = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
-  // UPDATED: Voice interface handlers with manual control
-  const handleVoiceTranscript = async (
-    transcript: string,
-    isFinal: boolean
-  ) => {
+  const switchToThinking = () => {
+    setView("thinking");
+  };
+
+  const handleVoiceTranscript = async (transcript: string, isFinal: boolean) => {
     setCurrentUserQuery(transcript);
     setVoiceTranscript(transcript);
   };
@@ -108,9 +103,7 @@ export default function Home() {
     setVoiceTranscript("");
   };
 
-  const handleVoiceEnd = () => {
-    // Voice ended - handled by controlled state
-  };
+  const handleVoiceEnd = () => {};
 
   const handleVoiceError = (error: string) => {
     console.error("Voice error:", error);
@@ -118,26 +111,39 @@ export default function Home() {
     setIsProcessingVoice(false);
   };
 
-  // UPDATED: Toggle voice listening with manual processing
   const toggleVoiceListening = async () => {
     if (isProcessingVoice) return;
 
     if (isVoiceListening) {
-      // User is stopping the recording
       setIsVoiceListening(false);
 
-      // Process the accumulated transcript if we have any
       if (voiceTranscript.trim()) {
         setIsProcessingVoice(true);
 
         try {
-          // Process the voice query using the voice service
           const result: VoiceQueryResult = await voiceService.processVoiceQuery(
             voiceTranscript
           );
 
-          if (result.success && result.response) {
-            await handleVoiceQuery(voiceTranscript, result.response);
+          let adjustedResponse = result.response;
+
+          // SPECIAL OVERRIDE for Jake's Bday
+          if (
+            voiceTranscript
+              .toLowerCase()
+              .includes("jake") &&
+            voiceTranscript.toLowerCase().includes("bday")
+          ) {
+            adjustedResponse = "I'm here! What's happening right now?";
+          }
+
+          if (result.success && adjustedResponse) {
+            if (
+              voiceTranscript.toLowerCase().includes("i want to remember this moment")
+            ) {
+              setShowPhotoUploadLeft(true);
+            }
+            await handleVoiceQuery(voiceTranscript, adjustedResponse);
           } else {
             setCurrentUserQuery(
               "I'm sorry, I couldn't process your request. Please try again."
@@ -153,81 +159,47 @@ export default function Home() {
         }
       }
     } else {
-      // User is starting to record
       setIsVoiceListening(true);
     }
   };
 
-  // Handle voice query processing
   const handleVoiceQuery = async (query: string, response: string) => {
     if (view === "home") {
-      // If on home page, start the conversation with the voice query
       setIsInitiated(true);
       setIsUsingRealQueries(true);
       setActualUserQueries([query]);
       if (carouselRef.current) carouselRef.current.autoplay.stop();
 
-      // Simulate thinking phase
       setView("thinking");
       await wait(2000);
 
-      // Move to chat with the voice query
       setConversation([{ sender: "user", query: query }]);
       setView("chat");
 
-      // Wait for user query typewriter to complete before showing response
-      // Calculate approximate time for user query to finish typing (120ms per word + buffer)
       const words = query.split(" ");
-      const typewriterDuration = words.length * 120 + 500; // 500ms buffer
+      const typewriterDuration = words.length * 120 + 500;
       await wait(typewriterDuration);
 
-      // Add response after user query is fully displayed
       setConversation((prev) => [
         ...prev,
         { sender: "agent", query: "", response: response },
       ]);
       setCurrentStepIndex(1);
     } else if (view === "chat") {
-      // If already in chat, add the new query to conversation
       const newQueryIndex = actualUserQueries.length;
       setActualUserQueries((prev) => [...prev, query]);
       setConversation((prev) => [...prev, { sender: "user", query: query }]);
 
-      // Wait for user query typewriter to complete before showing response
       const words = query.split(" ");
-      const typewriterDuration = words.length * 120 + 500; // 500ms buffer
+      const typewriterDuration = words.length * 120 + 500;
       await wait(typewriterDuration);
 
-      // Add response after user query is fully displayed
       setConversation((prev) => [
         ...prev,
         { sender: "agent", query: "", response: response },
       ]);
       setCurrentStepIndex((prev) => prev + 1);
     }
-  };
-
-  const switchToThinking = async () => {
-    await wait(1000);
-    setView("thinking");
-    await wait(2000);
-
-    // Use the first user query
-    const firstQuery = actualUserQueries[0];
-    setConversation([{ sender: "user", query: firstQuery }]);
-    setView("chat");
-
-    // Wait for user query typewriter to complete before showing response
-    const words = firstQuery.split(" ");
-    const typewriterDuration = words.length * 120 + 500; // 500ms buffer
-    await wait(typewriterDuration);
-
-    // Add a placeholder response (you can modify this based on your needs)
-    const firstResponse = "I'm processing your memory request...";
-    setConversation((prev) => [
-      ...prev,
-      { sender: "agent", query: "", response: firstResponse },
-    ]);
   };
 
   const handleGoHome = () => {
@@ -241,6 +213,7 @@ export default function Home() {
     setVoiceTranscript("");
     setIsVoiceListening(false);
     setIsProcessingVoice(false);
+    setShowPhotoUploadLeft(false);
     voiceService.resetConversation();
     if (carouselRef.current) {
       carouselRef.current.autoplay?.start();
@@ -291,7 +264,7 @@ export default function Home() {
                       what memory
                     </h1>
                     <h1 className="text-5xl font-bold text-gray-800 mt-2">
-                      would you like to relive today?
+                      would you like to inquire about today?
                     </h1>
                   </div>
                   <Swiper
@@ -354,7 +327,7 @@ export default function Home() {
                             ? "Processing your request..."
                             : isVoiceListening && voiceTranscript
                             ? voiceTranscript
-                            : currentUserQuery || "Ask about a memory..."}
+                            : currentUserQuery || "Ask or talk about a memory..."}
                         </p>
                       )}
                     </div>
@@ -427,53 +400,70 @@ export default function Home() {
         </AnimatePresence>
 
         <AnimatePresence>
-          {view === "chat" && (
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ duration: 0.5 }}
-              className="absolute inset-0"
-            >
-              <div className="flex h-screen">
-                <div className="w-1/3 bg-gray-50 border-r border-gray-200 p-8 flex flex-col justify-center items-center relative">
-                  <button
-                    onClick={handleGoHome}
-                    className="absolute top-6 left-6 text-2xl hover:text-gray-500"
-                  >
-                    &times;
-                  </button>
-                  <div className="text-center">
-                    <img
-                      src="/placeholder.png"
-                      alt="Jennifer Chen"
-                      className="w-52 h-52 object-cover rounded-xl shadow-xl"
-                    />
-                    <p className="mt-4 text-lg font-semibold">Jennifer Chen</p>
+  {view === "chat" && (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      transition={{ duration: 0.5 }}
+      className="absolute inset-0"
+    >
+      <div className="flex h-screen">
+        {/* Left Panel */}
+        <div className="w-1/3 bg-gray-50 border-r border-gray-200 p-8 flex flex-col justify-center items-center relative">
+          <button
+            onClick={handleGoHome}
+            className="absolute top-6 left-6 text-2xl hover:text-gray-500"
+          >
+            &times;
+          </button>
+          <div className="w-full">
+            {showPhotoUploadLeft ? (
+              <div className="flex flex-col items-start w-full">
+                <PhotoUploadModal
+                  isOpen={true}
+                  onClose={() => {}}
+                  onPhotoUpload={(photo) =>
+                    console.log("Photo uploaded during memory creation:", photo)
+                  }
+                />
+              </div>
+            ) : (
+              <div className="flex flex-col items-center w-full">
+                <img
+                  src="/Jennifer.jpeg"
+                  alt="Jennifer Chen"
+                  className="w-40 h-40 object-cover rounded-xl shadow-xl"
+                />
+                <p className="mt-4 text-lg font-semibold text-center">Jennifer Chen</p>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Right Panel */}
+        <div className="w-2/3 flex flex-col p-8 bg-white">
+          <div
+            ref={chatContainerRef}
+            className="flex-grow overflow-y-auto pr-4 space-y-6"
+          >
+            {conversation.map((chat, index) => (
+              <div key={index}>
+                {chat.sender === "user" ? (
+                  <div className="flex items-start gap-3 justify-end">
+                    <div className="bg-blue-500 text-white p-3 rounded-lg max-w-xl">
+                      <TypewriterText text={chat.query} />
+                    </div>
                   </div>
-                </div>
-                <div className="w-2/3 flex flex-col p-8 bg-white">
-                  <div
-                    ref={chatContainerRef}
-                    className="flex-grow overflow-y-auto pr-4 space-y-6"
-                  >
-                    {conversation.map((chat, index) => (
-                      <div key={index}>
-                        {chat.sender === "user" ? (
-                          <div className="flex items-start gap-3 justify-end">
-                            <div className="bg-blue-500 text-white p-3 rounded-lg max-w-xl">
-                              <TypewriterText text={chat.query} />
-                            </div>
-                          </div>
-                        ) : (
-                          <div className="flex items-start gap-3">
-                            <div className="bg-gray-100 p-3 rounded-lg max-w-xl">
-                              <TypewriterText text={chat.response || ""} />
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    ))}
+                ) : (
+                  <div className="flex items-start gap-3">
+                    <div className="bg-gray-100 p-3 rounded-lg max-w-xl">
+                      <TypewriterText text={chat.response || ""} />
+                    </div>
                   </div>
+                )}
+              </div>
+            ))}
+          </div>
 
                   {/* Chat input area */}
                   <div className="flex-shrink-0 pt-6">
