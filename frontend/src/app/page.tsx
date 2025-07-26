@@ -136,7 +136,7 @@ export default function Home() {
             voiceTranscript
           );
 
-          if (result.success) {
+          if (result.success && result.response) {
             await handleVoiceQuery(voiceTranscript, result.response);
           } else {
             setCurrentUserQuery(

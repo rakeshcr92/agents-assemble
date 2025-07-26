@@ -26,6 +26,10 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({
   const [isSupported, setIsSupported] = useState(false);
   const recognitionRef = useRef<SpeechRecognition | null>(null);
 
+  // Add accumulated transcript to handle pauses
+  const accumulatedTranscriptRef = useRef<string>("");
+  const lastFinalTranscriptRef = useRef<string>("");
+
   // Use external control if provided, otherwise fall back to internal state
   const isListening =
     externalIsListening !== undefined
@@ -48,6 +52,10 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({
 
         recognition.onstart = () => {
           console.log("Speech recognition started");
+          // Reset accumulated transcript when starting
+          accumulatedTranscriptRef.current = "";
+          lastFinalTranscriptRef.current = "";
+
           if (!controlled) {
             setInternalIsListening(true);
           }
@@ -58,6 +66,7 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({
           let interimTranscript = "";
           let finalTranscript = "";
 
+          // Process all results from the last processed index
           for (let i = event.resultIndex; i < event.results.length; i++) {
             const transcript = event.results[i][0].transcript;
             if (event.results[i].isFinal) {
@@ -67,14 +76,26 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({
             }
           }
 
-          // Send interim results for real-time display
-          if (interimTranscript) {
-            onTranscript(interimTranscript, false);
+          // Handle final results - accumulate them
+          if (finalTranscript) {
+            // Only add new final transcript (avoid duplicates)
+            if (finalTranscript !== lastFinalTranscriptRef.current) {
+              accumulatedTranscriptRef.current +=
+                (accumulatedTranscriptRef.current ? " " : "") +
+                finalTranscript.trim();
+              lastFinalTranscriptRef.current = finalTranscript;
+            }
           }
 
-          // Send final results (but don't auto-stop - wait for manual control)
-          if (finalTranscript) {
-            onTranscript(finalTranscript, true);
+          // Combine accumulated final transcript with current interim
+          const fullTranscript =
+            accumulatedTranscriptRef.current +
+            (accumulatedTranscriptRef.current && interimTranscript ? " " : "") +
+            interimTranscript;
+
+          // Send the complete transcript (accumulated + interim)
+          if (fullTranscript.trim()) {
+            onTranscript(fullTranscript.trim(), !interimTranscript);
           }
         };
 
@@ -93,13 +114,33 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({
             return;
           }
 
-          // Handle "no-speech" - also normal
+          // Handle "no-speech" - also normal, but restart recognition if still listening
           if (event.error === "no-speech") {
             console.log("No speech detected");
-            if (!controlled) {
-              setInternalIsListening(false);
+            // If we're still supposed to be listening, restart recognition
+            if (isListening && !disabled) {
+              console.log("Restarting recognition due to no-speech...");
+              setTimeout(() => {
+                if (
+                  recognitionRef.current &&
+                  (controlled ? externalIsListening : internalIsListening)
+                ) {
+                  try {
+                    recognitionRef.current.start();
+                  } catch (restartError) {
+                    console.error(
+                      "Failed to restart after no-speech:",
+                      restartError
+                    );
+                  }
+                }
+              }, 100);
+            } else {
+              if (!controlled) {
+                setInternalIsListening(false);
+              }
+              onVoiceEnd();
             }
-            onVoiceEnd();
             return;
           }
 
@@ -115,10 +156,35 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({
 
         recognition.onend = () => {
           console.log("Speech recognition ended");
-          if (!controlled) {
-            setInternalIsListening(false);
+
+          // If we're still supposed to be listening, restart recognition
+          const shouldStillListen = controlled
+            ? externalIsListening
+            : internalIsListening;
+
+          if (shouldStillListen && !disabled) {
+            console.log(
+              "Recognition ended but should still be listening, restarting..."
+            );
+            setTimeout(() => {
+              if (recognitionRef.current && shouldStillListen) {
+                try {
+                  recognitionRef.current.start();
+                } catch (restartError) {
+                  console.error("Failed to restart recognition:", restartError);
+                  if (!controlled) {
+                    setInternalIsListening(false);
+                  }
+                  onVoiceEnd();
+                }
+              }
+            }, 100);
+          } else {
+            if (!controlled) {
+              setInternalIsListening(false);
+            }
+            onVoiceEnd();
           }
-          onVoiceEnd();
         };
 
         recognitionRef.current = recognition;
@@ -133,6 +199,8 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({
     onError,
     controlled,
     internalIsListening,
+    externalIsListening,
+    disabled,
   ]);
 
   // Effect to handle external listening state changes
@@ -148,7 +216,12 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({
 
   const startListening = () => {
     if (recognitionRef.current && !disabled) {
+      // Reset transcript accumulation
+      accumulatedTranscriptRef.current = "";
+      lastFinalTranscriptRef.current = "";
+
       try {
+        setInternalIsListening(true);
         recognitionRef.current.start();
       } catch (error: any) {
         console.error("Error starting speech recognition:", error);
@@ -165,9 +238,11 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({
             }, 200);
           } catch (restartError) {
             console.error("Failed to restart recognition:", restartError);
+            setInternalIsListening(false);
             onError("Failed to start speech recognition");
           }
         } else {
+          setInternalIsListening(false);
           onError("Failed to start speech recognition");
         }
       }
@@ -176,6 +251,7 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({
 
   const stopListening = () => {
     if (recognitionRef.current) {
+      setInternalIsListening(false);
       recognitionRef.current.stop();
     }
   };
