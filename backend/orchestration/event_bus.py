@@ -5,6 +5,8 @@ from datetime import datetime
 from collections import defaultdict
 import logging
 import uuid
+from langchain.callbacks.base import AsyncCallbackHandler
+from langchain.schema import BaseMessage
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -22,8 +24,8 @@ class Event:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-class EventBusCallback:
-    """Callback handler that publishes events to the event bus"""
+class EventBusCallback(AsyncCallbackHandler):
+    """LangChain callback handler that publishes events to the event bus"""
     
     def __init__(self, event_bus: 'EventBus', source: str = "langchain"):
         self.event_bus = event_bus

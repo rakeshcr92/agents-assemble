@@ -6,6 +6,8 @@ from collections import deque
 from enum import Enum
 import logging
 import uuid
+from langchain.callbacks.base import AsyncCallbackHandler
+from langchain.schema import LLMResult
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -35,10 +37,10 @@ class Task:
     max_retries: int = 3
     result: Optional[Any] = None
     error: Optional[str] = None
-    callback_handler: Optional['TaskQueueCallback'] = None
+    callback_handler: Optional[AsyncCallbackHandler] = None
 
 
-class TaskQueueCallback:
+class TaskQueueCallback(AsyncCallbackHandler):
     """Callback handler for task execution tracking"""
     
     def __init__(self, task_queue: 'TaskQueue', task: Task):

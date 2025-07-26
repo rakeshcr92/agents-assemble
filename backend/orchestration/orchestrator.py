@@ -1,6 +1,7 @@
 from typing import Dict, List, Any, Optional, TypedDict, Annotated, Sequence
 from langgraph.graph import StateGraph, END
 from langchain.schema import BaseMessage, HumanMessage, AIMessage
+from langchain.callbacks.manager import CallbackManagerForChainRun
 from dataclasses import dataclass
 from enum import Enum
 import logging
@@ -364,8 +365,18 @@ class Orchestrator:
             context = state.get("context", {})
             insights = state.get("insights", [])
             
-            # Simulate response generation
-            response = f"""Based on your query: {state['task_data'].get('transcription', '')}
+            if agent:
+                # Use the actual agent
+                result = await agent.process({
+                    "plan": plan,
+                    "context": context,
+                    "insights": insights,
+                    "transcription": state['task_data'].get('transcription', '')
+                })
+                response = result.get("response", "No response generated")
+            else:
+                # Fallback response
+                response = f"""Based on your query: {state['task_data'].get('transcription', '')}
             
 I've analyzed the context and generated the following response:
 - Intent: {plan.get('intent', 'unknown')}

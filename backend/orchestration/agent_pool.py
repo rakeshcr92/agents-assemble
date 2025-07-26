@@ -6,6 +6,9 @@ from collections import defaultdict
 import logging
 from abc import ABC, abstractmethod
 import uuid
+from langchain.agents import AgentExecutor
+from langchain.memory import ConversationBufferMemory
+from langchain.schema import BaseMessage
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +26,7 @@ class AgentInstance:
     last_used_at: Optional[datetime] = None
     usage_count: int = 0
     current_task_id: Optional[str] = None
-    memory: Optional[Dict[str, Any]] = None
+    memory: Optional[ConversationBufferMemory] = None
 
 
 class BasePooledAgent(ABC):
@@ -80,7 +83,7 @@ class MockPlannerAgent(BasePooledAgent):
     
     async def initialize(self) -> None:
         logger.info(f"Initializing MockPlannerAgent {self.agent_id}")
-        self.memory = {}  # Simple dict instead of ConversationBufferMemory
+        self.memory = ConversationBufferMemory()
         await asyncio.sleep(0.1)
         
     async def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -128,6 +131,87 @@ class MockInsightAgent(BasePooledAgent):
         logger.info(f"Cleaning up MockInsightAgent {self.agent_id}")
 
 
+class MockContextAgent(BasePooledAgent):
+    """Mock context agent for testing"""
+    
+    async def initialize(self) -> None:
+        logger.info(f"Initializing MockContextAgent {self.agent_id}")
+        await asyncio.sleep(0.1)
+        
+    async def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        self.usage_count += 1
+        plan = data.get("plan", {})
+        # Simulate context analysis
+        await asyncio.sleep(0.2)
+        return {
+            "context": {
+                "user_profile": {
+                    "preferences": ["technical", "detailed"],
+                    "history": ["previous_queries"]
+                },
+                "environment": {
+                    "time": "afternoon",
+                    "location": "office"
+                }
+            }
+        }
+        
+    async def cleanup(self) -> None:
+        logger.info(f"Cleaning up MockContextAgent {self.agent_id}")
+
+
+class MockMemoryAgent(BasePooledAgent):
+    """Mock memory agent for testing"""
+    
+    async def initialize(self) -> None:
+        logger.info(f"Initializing MockMemoryAgent {self.agent_id}")
+        self.storage = []  # Simple list for memory storage
+        await asyncio.sleep(0.1)
+        
+    async def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        self.usage_count += 1
+        context = data.get("context", {})
+        # Simulate memory storage
+        await asyncio.sleep(0.1)
+        memory_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "interaction": data.get("interaction", ""),
+            "context": context
+        }
+        self.storage.append(memory_entry)
+        return {
+            "memory_id": str(uuid.uuid4()),
+            "stored": True
+        }
+        
+    async def cleanup(self) -> None:
+        logger.info(f"Cleaning up MockMemoryAgent {self.agent_id}")
+
+
+class MockResponseAgent(BasePooledAgent):
+    """Mock response agent for testing"""
+    
+    async def initialize(self) -> None:
+        logger.info(f"Initializing MockResponseAgent {self.agent_id}")
+        await asyncio.sleep(0.1)
+        
+    async def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        self.usage_count += 1
+        insights = data.get("insights", [])
+        plan = data.get("plan", {})
+        # Simulate response generation
+        await asyncio.sleep(0.3)
+        return {
+            "response": f"Based on your query, I found {len(insights)} insights. "
+                       f"The intent was {plan.get('intent', 'unknown')}. "
+                       f"This is a test response from agent {self.agent_id}.",
+            "confidence": 0.92
+        }
+        
+    async def cleanup(self) -> None:
+        logger.info(f"Cleaning up MockResponseAgent {self.agent_id}")
+
+
 class AgentPool:
     """Pool manager for LangChain agents"""
     
@@ -165,8 +249,26 @@ class AgentPool:
             max_size=5
         )
         self.register_agent_type(
+            "context_agent",
+            MockContextAgent,
+            min_size=1,
+            max_size=3
+        )
+        self.register_agent_type(
+            "memory_agent",
+            MockMemoryAgent,
+            min_size=1,
+            max_size=3
+        )
+        self.register_agent_type(
             "insight_agent",
             MockInsightAgent,
+            min_size=1,
+            max_size=3
+        )
+        self.register_agent_type(
+            "response_agent",
+            MockResponseAgent,
             min_size=1,
             max_size=3
         )
