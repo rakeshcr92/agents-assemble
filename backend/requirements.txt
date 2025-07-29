@@ -13,7 +13,7 @@ langchain==0.0.202
 langchain-google-vertexai==0.0.5
 
 # Google Cloud AI SDKs
-google-cloud-aiplatform==1.26.2
+google-cloud-aiplatform
 google-cloud-speech==2.15.1
 google-cloud-texttospeech==2.15.1
 
@@ -22,6 +22,9 @@ pydub==0.25.1
 
 # Optional but recommended for environment management
 python-dotenv==1.0.0
+
+#storage service
+aiofiles>=23.1.0
 
 # For testing if needed
 pytest==7.4.0
